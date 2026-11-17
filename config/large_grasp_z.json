@@ -1,0 +1,13 @@
+{
+  "grasp_z_m": 0.73804,
+  "unit": "m",
+  "frame": "base_link · arm_l_linkTCP (=夹爪 tip)",
+  "note": "大板固定板面/夹取 tip 高度；相对 2026-11-16 示教 0.74304 再降 5mm",
+  "meta": {
+    "xyz_mm": [607.94, 232.22, 738.04],
+    "source": "left TCP live 2026-11-16T15:12+08 then -5mm",
+    "tcp": "gripper_tip",
+    "use_left_current_z": false,
+    "prev_grasp_z_m": 0.74304
+  }
+}

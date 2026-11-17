@@ -1,0 +1,22 @@
+{
+  "id": "yolopose_pcb_small_20261030160220_f0956f",
+  "label": "PCB小板 · f0956f",
+  "category": "pcb_small",
+  "categories": [
+    "pcb_small"
+  ],
+  "category_labels": [
+    "PCB小板"
+  ],
+  "train_dates": [
+    "20261029"
+  ],
+  "train_data": "20261029",
+  "train_split": "121 train / 21 val",
+  "base_weights": "/home/ubuntu/workspace/lk_Perception/calibration/tray_pose_adapt/yolov8n-pose.pt",
+  "initial_id": "pose:base",
+  "initial_weights": "/home/ubuntu/workspace/lk_Perception/calibration/tray_pose_adapt/yolov8n-pose.pt",
+  "run": "yolopose_pcb_small_20261030160220_f0956f",
+  "method": "yolopose",
+  "manifest": "runs/yolopose_pcb_small_20261030160220_f0956f/manifest.json"
+}

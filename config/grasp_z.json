@@ -1,0 +1,31 @@
+{
+  "grasp_z_m": 0.71548,
+  "unit": "m",
+  "frame": "base_link · arm_*_linkTCP (=夹爪 tip)",
+  "note": "精定位 XY(+rz) 到位后降到此 tip 高度再收夹；与 head_tray_z_m 同源；相对原示教 +10mm",
+  "meta": {
+    "xyz_m": [
+      0.35314,
+      0.15777,
+      0.71548
+    ],
+    "rpy_rad": [
+      -1.54828,
+      0.03927,
+      -1.67988
+    ],
+    "xyz_mm": [
+      353.14,
+      157.77,
+      715.48
+    ],
+    "rpy_deg": [
+      -88.71,
+      2.25,
+      -96.25
+    ],
+    "arm": "A",
+    "source": "left TCP live 2026-11-10 +1cm",
+    "tcp": "gripper_tip"
+  }
+}

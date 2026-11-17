@@ -1,0 +1,78 @@
+schema_version: 1
+job:
+  name: single_arm_dual_camera_production
+status: success
+metadata:
+  calibration_method:
+    camera1: tsai
+    camera2: tsai
+    compared:
+    - tsai
+    - park
+    - horaud
+  sample_indices:
+  - 1
+  - 20
+  board_routing:
+    camera1:
+      name: tool_apriltag_id6
+      detector: apriltag
+      pattern_type: single_tag
+    camera2:
+      name: apriltag_id7_64mm
+      detector: apriltag
+      pattern_type: single_tag
+  legacy_outputs:
+    joint: /home/ubuntu/workspace/lk_ceshi/Calibration/calibration_runtime/data/results/single_arm_dual_camera/标定结果/joint_dual_camera_handeye.yaml
+    camera1: /home/ubuntu/workspace/lk_ceshi/Calibration/calibration_runtime/data/results/single_arm_dual_camera/标定结果/camera1_eye_to_hand.yaml
+    camera2: /home/ubuntu/workspace/lk_ceshi/Calibration/calibration_runtime/data/results/single_arm_dual_camera/标定结果/camera2_eye_in_hand.yaml
+  available_cameras:
+  - camera1
+  - camera2
+  synced_from: /home/ubuntu/workspace/lk_ceshi/Calibration/calibration_runtime/data/results/single_arm_dual_camera/标定结果
+  synced_at: '20260928_151344'
+  consistency:
+    camera1_translation_rms_mm: 1.0479366574629003
+    camera1_rotation_rms_deg: 0.42523454189715143
+    camera2_translation_rms_mm: 1.2918053995994707
+    camera2_rotation_rms_deg: 0.2223879944590275
+camera1_eye_to_hand:
+  camera: head_camera_01
+  transform_name: T_base_cam1
+  matrix:
+  - - -0.021603569796198263
+    - -0.996209276478148
+    - -0.08426365308331789
+    - 0.41966160426322463
+  - - -0.9996139949764502
+    - 0.020050771552191593
+    - 0.019230902406886283
+    - 0.05394462791176354
+  - - -0.01746845211465932
+    - 0.08464658303231612
+    - -0.996257902935616
+    - 0.6541564165390716
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+camera2_eye_in_hand:
+  camera: wrist_camera_01
+  transform_name: T_tool_cam2
+  matrix:
+  - - 0.874201403331715
+    - 0.45277672848493233
+    - 0.17539994457052138
+    - -0.04918789780604038
+  - - -0.4854044352049336
+    - 0.8241508029180541
+    - 0.29181841671304115
+    - -0.06868268644247486
+  - - -0.012427417118593923
+    - -0.3402479804378104
+    - 0.9402536206320887
+    - 0.044559964819268334
+  - - 0.0
+    - 0.0
+    - 0.0
+    - 1.0

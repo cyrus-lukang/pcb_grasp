@@ -1,0 +1,28 @@
+{
+  "id": "yolopose_3cls_20261105163435_041ee5",
+  "label": "PCB小板+空槽(nopcb)+PCB大板 · 041ee5",
+  "category": "pcb_small",
+  "categories": [
+    "pcb_small",
+    "nopcb",
+    "pcb_large"
+  ],
+  "category_labels": [
+    "PCB小板",
+    "空槽(nopcb)",
+    "PCB大板"
+  ],
+  "train_dates": [
+    "20261105",
+    "20261103",
+    "20261029"
+  ],
+  "train_data": "20261105、20261103、20261029",
+  "train_split": "346 train / 62 val",
+  "base_weights": "/home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/yolov8n-pose.pt",
+  "initial_id": "pose:base",
+  "initial_weights": "/home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/yolov8n-pose.pt",
+  "run": "yolopose_3cls_20261105163435_041ee5",
+  "method": "yolopose",
+  "manifest": "runs/yolopose_3cls_20261105163435_041ee5/manifest.json"
+}

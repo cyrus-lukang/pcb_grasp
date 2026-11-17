@@ -1,0 +1,15 @@
+path: /home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/runs/yolopose_2cls_20261103175747_1b27a1/dataset
+train: images/train
+val: images/val
+names:
+  0: PCB小板
+  1: 空槽(nopcb)
+nc: 2
+kpt_shape:
+- 4
+- 3
+flip_idx:
+- 1
+- 0
+- 3
+- 2

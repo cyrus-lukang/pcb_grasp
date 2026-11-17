@@ -1,0 +1,39 @@
+# 虚拟环境 / 缓存
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 实验数据与可视化落盘（不推）
+output/
+data/
+_feishu_upload/
+draft_*/
+*.npy
+
+# 模型权重（不推）
+models/**/*.pt
+models/**/*.pth
+models/**/*.onnx
+models/**/*.engine
+*.pt
+*.pth
+
+# 大体量标定 remap（不推）；保留小体积 json/yaml
+calib/stereo/stereo_maps*.yml
+calib/stereo/stereo_maps*.yaml
+
+# IDE / 系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 本地日志
+*.log
+/tmp/

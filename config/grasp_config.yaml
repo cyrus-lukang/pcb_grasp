@@ -1,0 +1,225 @@
+# PCB 粗定位(头) + 精定位(腕) 抓取配置
+# 本文件只服务 pcb_grasp；权重/标定默认走本仓库相对路径。
+# 腕精定位 rz：轮廓 match 方向（YOLO kp 仅作 Chamfer 搜索初值）
+
+models:
+  # 粗定位：头鱼眼 YOLO-Pose · 3cls（PCB小板=0 + 空槽nopcb=1 + PCB大板=2）· 20261105
+  # run: yolopose_3cls_20261105163435_041ee5 · PCB小板+空槽(nopcb)+PCB大板
+  head_pose_weights: models/yolopose/yolopose_3cls_20261105163435_041ee5/best.pt
+  # 精定位：腕部 YOLO-Pose · 26x wrist（imgsz=960）
+  # run: yolo_pose_26x_wrist_0821_0703_0707_960_0827_1613
+  wrist_pose_weights: /home/ubuntu/workspace/perception/projects/yuantu/weights/yolo_pose_26x_wrist_0821_0703_0707_960_0827_1613/weights/best.pt
+  # 精定位外轮廓模板（关键点定方向 + Chamfer 微调）
+  shape_model: TCT/shape_match/models/d435_pcb.npz
+
+# 腕部精定位：pose_outer_refine 同款（P1→P0 定方向，外轮廓匹配出 xyz/rz）
+shape_match:
+  enable: true
+  angle_offset_deg: 0.0
+  angle_range_deg: 30.0
+  edge_mode: outer-ring
+  score_thresh: 5.2
+
+# 同模类别 id（训好大板后只改权重 / 必要时改数字）
+classes:
+  pcb_small: 0
+  nopcb: 1
+  pcb_large: 2
+
+# 大板双臂对夹（流程对齐托盘 UI：识别 → 接近外开 → 确认抓取 → 合拢）
+# 左 tip=基座XY mid(P0,P3)；右 tip 沿法向 span；mid 是基座坐标不是像素。
+# 头定位：不用 FFS 角点深度；四角射线 ∩ 固定板面 Z（标定 tip 高度 = 板面高度）。
+large_board:
+  enable: true
+  # TCP=夹爪 tip：XY/Z 偏移均为 0（旧 tool_y/tool_z 会把接近位沿法向再偏一截）
+  tool_y_m: 0.0
+  tool_z_m: 0.0
+  # 接近位：相对 tip 各外开（同高），默认 5cm；左 tip 贴视觉左边，外开后离边有空
+  open_margin_m: 0.05
+  # 合拢额外内收；标定 tip_span_m 后建议 0（固定间距停下，靠力阈贴实）
+  squeeze_close_m: 0.0
+  squeeze_velocity_scale: 0.01
+  # 阻抗/遇阻停力阈（N）；合拢靠双臂位移，不收夹爪（RIM 暂退化慢速到位）
+  squeeze_force_n: 5.0
+  use_impedance: true
+  # —— 夹取高度 ——
+  # False：用下方标定 grasp_z_m（板面/tip）；True 会把当前 TCP Z 再减 tool_z（易算错平面）
+  use_left_current_z: false
+  # 基座 tip Z（米）= 头定位固定板面；2026-11-16 左臂 TCP 示教后再降 5mm
+  # 详见 config/large_grasp_z.json
+  grasp_z_m: 0.73804
+  # tip_span_m：右 tip 相对左 tip 的固定间距（米）
+  # 实测夹持约 43cm；全流程目标用 47cm（左贴边，右=左+47，右臂不易撞边）
+  tip_span_m: 0.47
+  hover_z_m: null
+  approach_velocity_scale: 0.08
+  half_width_m: null       # 兼容旧半宽；优先 tip_span_m
+  # True：大板角点用固定板面求交（板面 Z=tipZ）；False 才走头深/托盘混用
+  use_fixed_grasp_z_plane: true
+  # 大板：rx=-90 与小板相同；rz=夹爪中间线⊥P0→P3（小板 rz 则∥P0→P1，勿混用）
+  orient_edge: perp_p0p3
+  # 额外 rz 偏置（度），装夹爪偏了可微调
+  orient_rz_offset_deg: 0.0
+
+calib:
+  stereo_calib_json: calib/stereo/stereo_calib.json
+  stereo_maps_yml: calib/stereo/stereo_maps_raw.yml
+  # 眼在手外：头左鱼眼 → Link_Base
+  # 来源: lk_Perception/.../results/20261109_170058_head_fisheye_oct29style/dual_arm_six_camera_handeye.yaml
+  #        cameras.head_fisheye_left.matrix · Tsai · n=16
+  #        transl_rms≈2.29mm  rot_rms≈0.30°  reproj_mean≈0.13px
+  # 用于大板 tip 高度(grasp_z_m) / 宽度(tip_span_m) 标定；换外参后请重测这两项
+  T_base_cam:
+    - [-0.053510747484118104, -0.4676793909300464, 0.8822769333961937, 0.10827196979539061]
+    - [-0.9985556234493892, 0.020793546933001172, -0.049540844598639444, -0.027322216532933083]
+    - [0.004823565205573754, -0.8836535609079192, -0.4681165640238141, 1.2528033016128055]
+    - [0.0, 0.0, 0.0, 1.0]
+  # 眼在手上：工具 → 左腕 Gemini305（CV3H7610000L / portal cam13）
+  # 来源: .../results/20261110_wrist305_gemini_handeye/left_wrist_1_handeye.yaml
+  #        Tsai n=16  transl_rms≈1.79mm  rot_rms≈0.53°  reproj≈0.06px
+  T_tool_cam:
+    - [0.022507638320603984, -0.9635404908218506, -0.26661419460339364, 0.08453564370919689]
+    - [-0.010305485473285414, -0.26689119261767047, 0.9636715665994704, -0.13623085091056364]
+    - [-0.9996935546388147, -0.018942382371413824, -0.015936842965480036, 0.009649814255459525]
+    - [0.0, 0.0, 0.0, 1.0]
+  # 右腕备用（arm B）：.../right_wrist_1_handeye.yaml · CV3H761000XG / cam15
+  # T_tool_cam_right:
+  #   - [0.012814399993113179, 0.9647982705560006, 0.26267867877878187, -0.08584363273585255]
+  #   - [0.0003688328139679342, 0.2626956699016061, -0.9648786705992114, 0.1389369718434879]
+  #   - [-0.9999178241811533, 0.012461225746144888, 0.003010438129537496, 0.010925959852390895]
+  #   - [0.0, 0.0, 0.0, 1.0]
+  # 左腕 RGB 内参 1280x800 · BROWN_CONRADY_K6（Orbbec EEPROM）
+  wrist_intrinsics:
+    fx: 615.039856
+    fy: 615.071167
+    cx: 630.238953
+    cy: 401.217224
+    # OpenCV: k1,k2,p1,p2,k3,k4,k5,k6
+    distortion_coefficients: [-1.30164409, 0.86659974, 0.00031279, -0.00004894, -0.19230975, -1.28480470, 0.84361118, -0.18328477]
+  wrist_depth_scale: 0.001   # Gemini305 uint16 mm → m（D405 旧值 0.0001）
+  head_fixed_depth_cam_m: 0.85
+  # PCB 上表面 base-Z = 夹爪 tip（arm_*_linkTCP）贴板高度；与 motion.grasp_z_m 同源
+  # 2026-11-10：末端已改为夹爪尖，不再是法兰；旧值 -0.48 作废
+  head_tray_z_m: 0.71548
+
+# 头部深度 = 双目 Fast-FoundationStereo（不是 RealSense）
+depth:
+  ffs_weights: models/ffs/model_best_bp2_serialize.pth
+  ffs_cfg: models/ffs/cfg.yaml
+
+detect:
+  head_conf: 0.4
+  wrist_conf: 0.5
+  kpt_conf: 0.35
+  imgsz: 640
+  head_imgsz: 480
+  wrist_imgsz: 960
+  device: 0
+  # 2cls 头模：PCB(0)+nopcb(1) 都保留并分配 ID；抓取仍只选最近 PCB
+  head_class_ids: null
+  kp_i: 0
+  kp_j: 1
+  n_frames: 5
+  outlier_mad_k: 3.0
+  frame_gap_s: 0.03
+
+motion:
+  # 小板粗定位悬停：相机光心在板上方 hover_height，姿态=腕相机竖直向下（精定位拍摄）
+  # 腕精算完后抓取：切到末端竖直向下 (-90°,0)，只变 rz，再降 Z
+  hover_height_m: 0.30
+  # True：精定位反投影 camZ = hover_height（固定 30cm），不读腕部深度图
+  wrist_use_fixed_hover_depth: true
+  hover_camera_down: true
+  # 走廊高度；大位移时 rim_motion 按 min-j1 柱坐标分段
+  # （先抬升→外侧改半径/姿态→最后转 j1→再落目标），减轻底座扫到头部
+  safe_z_m: 0.02
+  # linkTCP 已是夹爪 tip，不再加法兰→尖端偏置
+  tcp_offset: [0.0, 0.0, 0.0]
+  tool_rz_offset_rad: 1.57079632679
+  # PLAN 线速度 ≈ rim.max_linear_vel * velocity_scale（略加快）
+  velocity_scale: 0.35
+  cart_vel_mm_s: 60
+  cart_acc_mm_s2: 120
+  vel_ratio: 25
+  acc_ratio: 25
+  fine_xy_only: true
+  fine_apply_rz: true
+  # 已并入 hover_height；保持 0 兼容旧字段
+  fine_clear_dy_m: 0.0
+  fine_clear_dz_m: 0.0
+  fine_descend_dz_m: 0.10   # 仅当未示教 grasp_z 时使用（相对下降）
+  grasp_z_file: config/grasp_z.json
+  # 相对示教 tip 高度上抬 5mm 再抓（防压板）
+  grasp_z_lift_m: 0.01
+  # 示教夹取高度（arm_*_linkTCP = 夹爪 tip Z）；2026-11-10 左臂现场
+  grasp_z_m: 0.71548
+  # 多板：粗定位按到基座 XY 距离赋 ID（1=最近）；优先抓 ID=此值
+  # 腕侧匹配不到该 ID 时，回退到腕部实际识别到的板（只抓能认出的）
+  target_board_id: 2
+  board_match_max_dist_m: 0.12
+  dry_run: true
+  # IK preferred seed：用 POC 左等待位（自然肘型），勿用拧巴的 ready
+  ready_joints_A: [63.707, 88.581, -4.036, -94.341, -63.993, 6.160, -86.607]
+  # 动完 → 等静止 → 再识别/收夹；到位后约 1s 再抓
+  settle_s: 1.0
+  still_pos_tol_m: 0.0015
+  still_rot_tol_rad: 0.015
+  still_hold_s: 0.15
+  still_timeout_s: 3.0
+
+# 运控：rim = 定位算完位姿后调用 perception CLI（pcb_grasp 不做路径规划）
+#   source ~/workspace/perception/.venv-sdk/bin/activate
+#   cd .../perception/projects/yuantu/pipelines
+#   python -m rim_python.move_to_pose --arm left|right --pose x,y,z,r,p,y --execute
+#       tj  = 旧 TJ_demo（仅兼容）
+motion_backend: rim
+
+rim:
+  frame_bundle: "10.3.8.7:50066"
+  mc: ""   # 空=同主机 :50061
+  connect_timeout_s: 10
+  plan_timeout_s: 120
+  # 仅作读数/兼容字段；实际速度由 move_to_pose CLI / MC 默认决定
+  max_linear_vel: 0.06
+  max_angular_vel: 0.25
+
+tj_demo:
+  robot_ip: "192.168.1.190"
+  arm: "A"
+  use_impedance: true
+  contact_threshold_n: 10.0
+  # 知行夹爪：对齐 rimbot_poc/config/robot_config.json end_effector
+  gripper:
+    # rim_python 开度：0=全闭 1=全开；收夹用 0.4（略留缝夹板）
+    grasp_position: 0.4
+    release_position: 1.0
+    speed: 50
+    torque_grasp: 30
+    torque_release: 60
+    com_ch: 2
+
+cameras:
+  # portal/bundle = rim frame_bundle（默认 rim.frame_bundle=10.3.8.7:50066）
+  #   注：8787 watch 页能看流，但 WS 目前不推 sample，故 pcb_grasp 改走 50066
+  # v4l2 = 本机 /dev/video*（机柜旁直连 S36 时用）
+  head_source: portal
+  portal: "10.3.8.7:8787"      # 仅作旧字段保留；实际取流用 rim.frame_bundle
+  portal_head_left_id: 0
+  portal_head_right_id: 1
+  portal_max_hz: 8
+  portal_timeout_s: 60
+  head_left: /dev/video6
+  head_right: /dev/video7
+  head_width: 1920
+  head_height: 1536
+  s36_sdk: /home/ubuntu/workspace/ccg3_8m_sdk/ccg3_camera_python
+  # 腕部：Gemini305（frame_bundle cam13 + depth12）；d405=本机 RealSense
+  wrist_source: portal
+  portal_wrist_id: 13          # 13=左腕 CV3H7610000L；15=右腕 CV3H761000XG
+  portal_wrist_depth_id: 12    # 与彩色成对的 Z16
+  wrist_need_depth: true
+  wrist_undistort: true        # 305 畸变大，精定位前去畸变
+  wrist_serial: "262422274334" # 仅 wrist_source=d405
+  wrist_width: 1280
+  wrist_height: 800
+  wrist_fps: 30

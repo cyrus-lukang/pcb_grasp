@@ -1,0 +1,25 @@
+# Wrist D405 synced 20260928_151344 method=tsai rms=1.292mm
+schema_version: 1
+camera: wrist_camera_01
+serial: '260322274901'
+transform_name: T_tool_cam2
+source_job: single_arm_dual_camera_production
+synced_at: '20260928_151344'
+synced_from: /home/ubuntu/workspace/lk_ceshi/Calibration/calibration_runtime/data/results/single_arm_dual_camera/标定结果/camera2_eye_in_hand.yaml
+T_tool_cam:
+- - 0.874201403331715
+  - 0.45277672848493233
+  - 0.17539994457052138
+  - -0.04918789780604038
+- - -0.4854044352049336
+  - 0.8241508029180541
+  - 0.29181841671304115
+  - -0.06868268644247486
+- - -0.012427417118593923
+  - -0.3402479804378104
+  - 0.9402536206320887
+  - 0.044559964819268334
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0

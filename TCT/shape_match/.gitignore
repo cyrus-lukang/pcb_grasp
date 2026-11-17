@@ -1,0 +1,9 @@
+.deps/
+.venv/
+__pycache__/
+*.pyc
+selftest.jpg
+match.jpg
+match_same.jpg
+d435_match.jpg
+d435_match.edges.png

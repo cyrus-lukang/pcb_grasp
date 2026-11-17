@@ -1,0 +1,23 @@
+schema_version: 1
+camera:
+  name: wrist_camera_01
+  serial: "260322274901"
+  model_type: pinhole
+  image_width: 1280
+  image_height: 720
+intrinsic:
+  camera_matrix:
+    - [656.8737451885755, 0.0, 643.6214667137888]
+    - [0.0, 656.8630776097101, 376.2045954058799]
+    - [0.0, 0.0, 1.0]
+  distortion_model: plumb_bob
+  distortion_coefficients:
+    - -0.05138171704232727
+    - 0.05330416821509417
+    - 0.0008927286885437309
+    - 0.0004594991113507615
+    - -0.01775355996040633
+metadata:
+  source: migrated_from_uploaded_intrinsic_yaml
+  board_config: configs/boards/chessboard_9x6.yaml
+  reprojection_error_px: null
