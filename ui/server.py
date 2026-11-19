@@ -74,6 +74,7 @@ _head_cam = None
 _wrist_cam = None
 _preview_pipe = None
 _preview_jpeg: bytes = b""
+_wrist_preview_jpeg: bytes = b""
 _preview_meta: dict = {"ok": False, "error": "", "ts": 0.0, "n_det": 0}
 _confirm_jpeg: bytes = b""
 _confirm_event = threading.Event()
@@ -735,12 +736,13 @@ def _do_inward_step() -> dict:
 
 
 def _run_job(opts: dict) -> None:
-    global _job, _preview_jpeg, _confirm_jpeg
+    global _job, _preview_jpeg, _confirm_jpeg, _wrist_preview_jpeg
     from pcb_grasp.pipeline import GraspPipeline
 
     batch_dir = next_batch_dir(Path(opts.get("vis") or (ROOT / "output" / "live_vis")))
     plan_only = bool(opts.get("plan_only"))
     with _lock:
+        _wrist_preview_jpeg = b""
         _job.update(
             {
                 "running": True,
@@ -753,6 +755,7 @@ def _run_job(opts: dict) -> None:
                 "confirm_message": "",
                 "confirm_plan": None,
                 "confirm_board_id": None,
+                "has_wrist_vis": False,
             }
         )
     dry_pair = None
@@ -799,6 +802,11 @@ def _run_job(opts: dict) -> None:
         force = opts.get("force_class")
         if force in ("", "auto", None):
             force = None
+        is_large_single = str(force or "") in (
+            "large_single",
+            "large-single",
+            "single",
+        )
         pipe = GraspPipeline(
             cfg=_cfg,
             motion=motion,
@@ -806,11 +814,13 @@ def _run_job(opts: dict) -> None:
             force_class=force,
         )
 
-        # 真机抓取 / 识别抓取点 / 精定位：尽量开腕部
+        # 真机抓取 / 识别抓取点 / 精定位 / 大板单臂：开腕部
         stage_opt = str(opts.get("stage") or "all")
         need_wrist = (
-            want_real and stage_opt in ("all", "fine")
-        ) or (plan_only and stage_opt in ("all", "fine"))
+            is_large_single
+            or (want_real and stage_opt in ("all", "fine"))
+            or (plan_only and stage_opt in ("all", "fine"))
+        )
         if need_wrist and _camera_snapshot().get("mode") == "head":
             with _cam_lock:
                 try:
@@ -820,11 +830,17 @@ def _run_job(opts: dict) -> None:
                     LOG.warning("wrist open for grasp/plan: %s", exc)
 
         large_cb = None
-        if want_real and bool(opts.get("confirm_large", True)) and not plan_only:
+        if (
+            want_real
+            and bool(opts.get("confirm_large", True))
+            and not plan_only
+            and not is_large_single
+        ):
             large_cb = _large_confirm
 
         def _on_progress(partial, phase: str) -> None:
-            """粗/精定位一出就写进 job.result，供网页在运动前显示。"""
+            """粗/精定位一出就写进 job.result，并推头/腕识别图到网页。"""
+            global _preview_jpeg, _wrist_preview_jpeg
             try:
                 payload = _result_payload(partial, batch_dir)
                 payload["ok"] = None  # 进行中
@@ -843,12 +859,35 @@ def _run_job(opts: dict) -> None:
                             f"粗定位完成 ID={payload.get('target_board_id')} "
                             f"→ 开始接近…"
                         )
+                    if getattr(pipe, "_last_head_pose_vis", None) is not None:
+                        try:
+                            jpeg = _encode_jpeg(pipe._last_head_pose_vis)  # noqa: SLF001
+                            with _lock:
+                                _preview_jpeg = jpeg
+                        except Exception:
+                            pass
                 elif phase == "fine":
                     d = payload.get("dxy_mm") or {}
                     msg = (
                         f"精定位完成 Δxy=({d.get('dx', '?')},{d.get('dy', '?')})mm "
                         f"|Δ|={d.get('hypot', '?')}mm → 开始抓取移动…"
                     )
+                    if getattr(pipe, "_last_wrist_pose_vis", None) is not None:
+                        try:
+                            wjpeg = _encode_jpeg(
+                                pipe._last_wrist_pose_vis  # noqa: SLF001
+                            )
+                            with _lock:
+                                _wrist_preview_jpeg = wjpeg
+                        except Exception:
+                            pass
+                    if getattr(pipe, "_last_head_pose_vis", None) is not None:
+                        try:
+                            jpeg = _encode_jpeg(pipe._last_head_pose_vis)  # noqa: SLF001
+                            with _lock:
+                                _preview_jpeg = jpeg
+                        except Exception:
+                            pass
                 else:
                     msg = f"进度: {phase}"
                 payload["message"] = msg
@@ -859,6 +898,7 @@ def _run_job(opts: dict) -> None:
                             "message": msg,
                             "result": payload,
                             "batch_dir": str(batch_dir),
+                            "has_wrist_vis": bool(_wrist_preview_jpeg),
                         }
                     )
                 LOG.info("ui progress [%s] %s", phase, msg)
@@ -894,6 +934,13 @@ def _run_job(opts: dict) -> None:
                             "n_det": -1,
                         }
                     )
+            except Exception:
+                pass
+        if getattr(pipe, "_last_wrist_pose_vis", None) is not None:
+            try:
+                wjpeg = _encode_jpeg(pipe._last_wrist_pose_vis)  # noqa: SLF001
+                with _lock:
+                    _wrist_preview_jpeg = wjpeg
             except Exception:
                 pass
 
@@ -1026,6 +1073,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/camera":
             self._send(200, {"ok": True, "camera": _camera_snapshot()})
+            return
+        if path == "/api/wrist.jpg":
+            with _lock:
+                jpeg = _wrist_preview_jpeg
+            if jpeg:
+                self._send_jpeg(jpeg)
+                return
+            self._send(404, {"ok": False, "error": "暂无腕部精定位图"})
             return
         if path == "/api/head.jpg":
             job = _job_snapshot()

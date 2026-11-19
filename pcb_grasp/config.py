@@ -29,6 +29,7 @@ class GraspConfig:
     stereo_maps_yml: str = ""
     T_base_cam: np.ndarray = field(default_factory=lambda: np.eye(4))
     T_tool_cam: np.ndarray = field(default_factory=lambda: np.eye(4))
+    T_tool_cam_right: np.ndarray | None = None  # 右腕手眼；大板精定位看 P2
     wrist_fx: float = 615.0
     wrist_fy: float = 615.0
     wrist_cx: float = 630.0
@@ -50,7 +51,7 @@ class GraspConfig:
     head_class_ids: list[int] | None = None
     kp_i: int = 0
     kp_j: int = 1
-    detect_n_frames: int = 5
+    detect_n_frames: int = 10
     detect_outlier_mad_k: float = 3.0
     detect_frame_gap_s: float = 0.03
 
@@ -170,9 +171,25 @@ class GraspConfig:
     large_use_fixed_grasp_z_plane: bool = True
     # True：两臂夹取法兰 Z 取左臂当前高度
     large_use_left_current_z: bool = True
-    # 大板末端 rz：perp_p0p3=夹爪中间线⊥03（默认）
-    large_orient_edge: str = "perp_p0p3"
+    # 大板末端 rz：parallel_p2p3=夹爪中间线∥P2→P3（默认；23⊥03）
+    large_orient_edge: str = "parallel_p2p3"
     large_orient_rz_offset_deg: float = 0.0
+    # 接近：mid(P2,P3) 后 x+=dx；左 y+=dy、右 y-=dy（基座系右臂 Y 为负侧）
+    large_approach_dx_m: float = 0.16
+    large_approach_dy_m: float = 0.25
+    # 大板腕部精定位：左看 P3、右看 P2（上方 hover）→ 合成精 2/3
+    large_fine_enable: bool = True
+    large_wrist_pose_weights: str = ""
+    large_fine_hover_height_m: float = 0.10
+    large_fine_match_max_dist_m: float = 0.15
+    # 大板单臂支路 B：无头相机；腕部粗定位 → 左臂精看 P2/P3 → 停 mid23
+    large_single_enable: bool = True
+    # 粗定位固定法兰 [x,y,z,rx,ry,rz]（米/弧度）；null=后面写死，未配则用当前 TCP
+    large_single_coarse_flange: list[float] | None = None
+    # 精定位后停在 mid(P2,P3) 的 tip/板面上方相机高度（米）；null=后面写死
+    large_single_stop_z_m: float | None = None
+    # 单臂精定位悬停高度（相对板面）；null 复用 large_fine_hover_height_m
+    large_single_fine_hover_height_m: float | None = None
 
 
 def _load_raw(path: Path) -> dict[str, Any]:
@@ -257,6 +274,9 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     Ttc = g("calib", "T_tool_cam")
     if Ttc is not None:
         cfg.T_tool_cam = _mat4(Ttc)
+    Ttc_r = g("calib", "T_tool_cam_right")
+    if Ttc_r is not None and Ttc_r not in ("null", ""):
+        cfg.T_tool_cam_right = _mat4(Ttc_r)
 
     wi = g("calib", "wrist_intrinsics", default={}) or {}
     cfg.wrist_fx = float(wi.get("fx", cfg.wrist_fx))
@@ -470,10 +490,44 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
         lb.get("use_left_current_z", cfg.large_use_left_current_z)
     )
     cfg.large_orient_edge = str(
-        lb.get("orient_edge", cfg.large_orient_edge) or "p0p1"
+        lb.get("orient_edge", cfg.large_orient_edge) or "parallel_p2p3"
     ).strip().lower()
     cfg.large_orient_rz_offset_deg = float(
         lb.get("orient_rz_offset_deg", cfg.large_orient_rz_offset_deg)
+    )
+    cfg.large_approach_dx_m = float(
+        lb.get("approach_dx_m", cfg.large_approach_dx_m)
+    )
+    cfg.large_approach_dy_m = float(
+        lb.get("approach_dy_m", cfg.large_approach_dy_m)
+    )
+    cfg.large_fine_enable = bool(lb.get("fine_enable", cfg.large_fine_enable))
+    wpath = lb.get("wrist_pose_weights", cfg.large_wrist_pose_weights)
+    if wpath in (None, "null", ""):
+        cfg.large_wrist_pose_weights = ""
+    else:
+        cfg.large_wrist_pose_weights = _resolve_path(root, str(wpath))
+    cfg.large_fine_hover_height_m = float(
+        lb.get("fine_hover_height_m", cfg.large_fine_hover_height_m)
+    )
+    cfg.large_fine_match_max_dist_m = float(
+        lb.get("fine_match_max_dist_m", cfg.large_fine_match_max_dist_m)
+    )
+    # 单臂支路 B
+    sa = lb.get("single_arm", {}) or {}
+    cfg.large_single_enable = bool(sa.get("enable", cfg.large_single_enable))
+    cfl = sa.get("coarse_flange_pose", cfg.large_single_coarse_flange)
+    if cfl in (None, "null", ""):
+        cfg.large_single_coarse_flange = None
+    else:
+        cfg.large_single_coarse_flange = [float(x) for x in list(cfl)[:6]]
+    stop_z = sa.get("stop_z_m", cfg.large_single_stop_z_m)
+    cfg.large_single_stop_z_m = (
+        None if stop_z in (None, "null", "") else float(stop_z)
+    )
+    sh = sa.get("fine_hover_height_m", cfg.large_single_fine_hover_height_m)
+    cfg.large_single_fine_hover_height_m = (
+        None if sh in (None, "null", "") else float(sh)
     )
     return cfg
 

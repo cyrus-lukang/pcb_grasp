@@ -145,4 +145,107 @@ def median_object_pose(
         edge_yaw=edge,
         corners_base=corners_base,
         conf=conf,
+        board_id=kept[0].board_id,
+        cls_id=int(getattr(kept[0], "cls_id", 0) or 0),
     )
+
+
+def pose_keep_mask(poses: Sequence[ObjectPose], mad_k: float = 3.0) -> list[bool]:
+    """XYZ(+rz) MAD keep mask；全灭则全保留。"""
+    if len(poses) <= 1:
+        return [True] * len(poses)
+    xs = [p.x for p in poses]
+    ys = [p.y for p in poses]
+    zs = [p.z for p in poses]
+    keep = _mad_keep(xs, mad_k) & _mad_keep(ys, mad_k) & _mad_keep(zs, mad_k)
+    rzs = [p.rz for p in poses]
+    ref = math.atan2(
+        float(np.mean([math.sin(r) for r in rzs])),
+        float(np.mean([math.cos(r) for r in rzs])),
+    )
+    rz_off = [math.atan2(math.sin(r - ref), math.cos(r - ref)) for r in rzs]
+    keep = keep & _mad_keep(rz_off, mad_k)
+    if not bool(np.any(keep)):
+        return [True] * len(poses)
+    return [bool(x) for x in keep]
+
+
+def mean_pose_xyz(poses: Sequence[ObjectPose]) -> tuple[float, float, float]:
+    if not poses:
+        raise ValueError("empty poses")
+    return (
+        float(np.mean([p.x for p in poses])),
+        float(np.mean([p.y for p in poses])),
+        float(np.mean([p.z for p in poses])),
+    )
+
+
+def pick_closest_to_mean_pose(
+    poses: Sequence[ObjectPose],
+    *,
+    mad_k: float = 3.0,
+) -> tuple[ObjectPose, int, list[bool], tuple[float, float, float]]:
+    """过滤异常值后，取最接近**平均位置**的那一帧真实样本（非合成中值）。
+
+    Returns ``(pose, index, keep_mask, mean_xyz)``.
+    """
+    if not poses:
+        raise ValueError("no poses")
+    if len(poses) == 1:
+        p0 = poses[0]
+        return p0, 0, [True], (p0.x, p0.y, p0.z)
+
+    keep = pose_keep_mask(poses, mad_k)
+    kept = [p for p, ok in zip(poses, keep) if ok]
+    if not kept:
+        kept = list(poses)
+        keep = [True] * len(poses)
+    mx, my, mz = mean_pose_xyz(kept)
+    best_i, best_d = 0, float("inf")
+    for i, p in enumerate(poses):
+        if not keep[i]:
+            continue
+        d = (p.x - mx) ** 2 + (p.y - my) ** 2 + (p.z - mz) ** 2
+        if d < best_d:
+            best_i, best_d = i, d
+    n_drop = len(poses) - sum(1 for ok in keep if ok)
+    LOG.info(
+        "pick closest-to-mean: keep %d/%d (drop %d) mean_xy=(%.4f,%.4f) "
+        "→ frame#%d Δxy=%.1fmm",
+        sum(1 for ok in keep if ok),
+        len(poses),
+        n_drop,
+        mx,
+        my,
+        best_i + 1,
+        math.hypot(poses[best_i].x - mx, poses[best_i].y - my) * 1000.0,
+    )
+    return poses[best_i], best_i, keep, (mx, my, mz)
+
+
+def pick_closest_to_mean_xyz(
+    points: Sequence[Sequence[float]],
+    *,
+    mad_k: float = 3.0,
+) -> tuple[list[float], int, list[bool]]:
+    """角点 XYZ 多帧：MAD 滤异常 → 取最接近均值的那次真实测量。"""
+    if not points:
+        raise ValueError("no points")
+    if len(points) == 1:
+        return [float(x) for x in points[0][:3]], 0, [True]
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    zs = [float(p[2]) for p in points]
+    keep = _mad_keep(xs, mad_k) & _mad_keep(ys, mad_k) & _mad_keep(zs, mad_k)
+    if not bool(np.any(keep)):
+        keep = np.ones(len(points), dtype=bool)
+    kept_idx = [i for i, ok in enumerate(keep) if ok]
+    mx = float(np.mean([xs[i] for i in kept_idx]))
+    my = float(np.mean([ys[i] for i in kept_idx]))
+    mz = float(np.mean([zs[i] for i in kept_idx]))
+    best_i, best_d = kept_idx[0], float("inf")
+    for i in kept_idx:
+        d = (xs[i] - mx) ** 2 + (ys[i] - my) ** 2 + (zs[i] - mz) ** 2
+        if d < best_d:
+            best_i, best_d = i, d
+    return [xs[best_i], ys[best_i], zs[best_i]], best_i, [bool(x) for x in keep]

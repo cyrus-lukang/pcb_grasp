@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -259,6 +259,53 @@ def draw_multi_board_vis(
             (int(round(cx)) - 40, int(round(cy)) - 8),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.75,
+            color,
+            2,
+        )
+    return vis
+
+
+def draw_grasp_points_on_head(
+    image_bgr: np.ndarray,
+    points: list[tuple[str, Sequence[float], tuple[int, int, int]]],
+    *,
+    K,
+    T_base_cam: np.ndarray,
+    title: str | None = "grasp←base (handeye)",
+) -> np.ndarray:
+    """把基座系抓取点经 ``inv(T_base_cam)`` 投到头相机图上并标注。
+
+    ``points``: ``(label, xyz_base, bgr_color)``；越界/相机后方跳过。
+    """
+    import cv2
+
+    from .localize import base_xyz_to_pixel
+
+    vis = image_bgr.copy()
+    h, w = vis.shape[:2]
+    if title:
+        cv2.putText(
+            vis, title, (8, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 255), 2
+        )
+    for label, xyz, color in points:
+        if xyz is None or len(xyz) < 3:
+            continue
+        uv = base_xyz_to_pixel(xyz, K=K, T_base_cam=T_base_cam)
+        if uv is None:
+            continue
+        u, v = int(round(uv[0])), int(round(uv[1]))
+        if u < -20 or v < -20 or u > w + 20 or v > h + 20:
+            continue
+        cv2.drawMarker(
+            vis, (u, v), color, markerType=cv2.MARKER_CROSS, markerSize=22, thickness=2
+        )
+        cv2.circle(vis, (u, v), 8, color, 2)
+        cv2.putText(
+            vis,
+            str(label),
+            (u + 10, v - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
             color,
             2,
         )

@@ -22,11 +22,7 @@
     #estop { background: var(--err); }
     #plan { background: var(--amber); color: #1a1400; }
     #run { background: var(--ok); color: #062a1c; }
-    #coarse-go { background: #2d6a9f; }
-    #fine-go { background: #1a8a6a; }
     #connect-cam, #connect-robot { background: #445; }
-    #save-reset { background: #5a4a8a; }
-    #go-reset { background: #2a6a8a; }
     #confirm-yes { background: var(--ok); color: #062a1c; }
     #confirm-no { background: var(--err); }
     pre { background: #0f121a; border-radius: 8px; padding: 12px; overflow: auto; font-size: 0.78rem; max-height: 280px; margin: 0; }
@@ -57,13 +53,13 @@
 <body>
   <main>
     <h1>pcb_grasp 抓取控制台</h1>
-    <p class="lead">定位由本页算位姿，动臂只调 <code>rim_python.move_to_pose</code>。「粗定位」：小板→单臂悬停；大板→左右臂接近（P0→P3），接近后点「内收 5mm」逐步夹近。「精定位」仅小板腕精→示教高→收夹。</p>
+    <p class="lead">选类别后「只定位」或「全流程」。大板双臂：头粗 → 左右腕精 → 接近后可内收。大板单臂：无头，腕粗 → 左精 P2/P3 → 停 mid23。</p>
 
     <div id="camera-banner" class="banner connecting">正在连接相机…</div>
-    <div id="robot-banner" class="banner err">机械臂未连接（看抓取点不需要）</div>
+    <div id="robot-banner" class="banner err">机械臂未连接（只定位可不连）</div>
 
     <div id="confirm-banner">
-      <h2>大板 · 内收夹近</h2>
+      <h2>大板双臂 · 内收夹近</h2>
       <p id="confirm-text">—</p>
       <div class="actions">
         <button id="confirm-inward" type="button">内收 5mm</button>
@@ -72,53 +68,58 @@
     </div>
 
     <section class="card">
-      <label>头部相机视野 / 抓取点</label>
+      <label id="head-label">头部 / 规划图</label>
       <div class="vis-wrap">
         <img id="head-vis" alt="head camera" />
       </div>
       <p class="vis-meta" id="vis-meta">等待相机…</p>
     </section>
+    <section class="card">
+      <label>腕部相机</label>
+      <div class="vis-wrap">
+        <img id="wrist-vis" alt="wrist camera" />
+      </div>
+      <p class="vis-meta" id="wrist-meta">腕部识别图（单臂大板：粗定位腕图叠点）</p>
+    </section>
 
     <section class="card">
       <div class="grid">
         <div>
-          <label for="force">类别强制</label>
+          <label for="force">流程 / 类别</label>
           <select id="force">
-            <option value="auto">auto（按模型 cls）</option>
-            <option value="small">small（强制小板）</option>
-            <option value="large">large（强制大板几何）</option>
+            <option value="auto">auto（头粗 cls：小板/大板双臂）</option>
+            <option value="small">小板</option>
+            <option value="large">大板双臂</option>
+            <option value="large_single">大板单臂（腕粗，无头）</option>
           </select>
         </div>
-        <div class="check"><input id="grasp" type="checkbox" checked /><label for="grasp" style="margin:0">精定位时收夹（大板改为「内收 5mm」，无自动合拢）</label></div>
+        <div class="check">
+          <input id="grasp" type="checkbox" checked />
+          <label for="grasp" style="margin:0">全流程时收夹 / 大板双臂允许内收会话</label>
+        </div>
       </div>
       <div class="actions">
         <button id="connect-cam" type="button">连接相机</button>
         <button id="connect-robot" type="button">连接机械臂</button>
-        <button id="plan" type="button">识别抓取点</button>
-        <button id="coarse-go" type="button">粗定位</button>
-        <button id="fine-go" type="button">精定位</button>
-        <button id="run" type="button">全流程（头+腕）</button>
+        <button id="plan" type="button">只定位</button>
+        <button id="run" type="button">全流程</button>
         <button id="inward" type="button">内收 5mm</button>
         <button id="inward-end" type="button">结束内收</button>
-        <button id="save-reset" type="button">记为复位位</button>
-        <button id="go-reset" type="button">复位</button>
         <button id="reload" type="button">重载配置</button>
         <button id="estop" type="button">急停</button>
       </div>
       <p class="hint" id="hint">加载配置…</p>
-      <p class="hint">粗/精定位：只识别并打印 xyzrpy（mm,deg），不动臂。大板全流程到接近位后点「内收 5mm」逐步夹近（沿板法向，左 +u / 右 −u）。</p>
-      <p class="hint" id="reset-hint">复位位：未记录（记当前 XYZ，姿态固定 rpy=-90°/0°/0°）</p>
       <div id="status"></div>
     </section>
 
     <section class="card">
-      <label>move_to_pose 命令（末端 xyzrpy=mm,deg · 不动臂，可复制）</label>
-      <pre id="pose-xy">点「粗定位」或「精定位」后打印命令…</pre>
+      <label>move_to_pose 命令（末端 xyzrpy=mm,deg）</label>
+      <pre id="pose-xy">点「只定位」或「全流程」后打印…</pre>
     </section>
 
     <section class="card">
-      <label>识别抓取点 · 基座 XY（mid=基座坐标中点，非像素）</label>
-      <pre id="plan-xy">点「识别抓取点」后显示 P0/P3 与 tipL/tipR…</pre>
+      <label>定位结果 · 基座 XY</label>
+      <pre id="plan-xy">—</pre>
     </section>
 
     <section class="card">
@@ -136,11 +137,11 @@
     const confirmBanner = document.getElementById("confirm-banner");
     const confirmText = document.getElementById("confirm-text");
     const headVis = document.getElementById("head-vis");
+    const wristVis = document.getElementById("wrist-vis");
     const visMeta = document.getElementById("vis-meta");
+    const wristMeta = document.getElementById("wrist-meta");
     const planBtn = document.getElementById("plan");
     const runBtn = document.getElementById("run");
-    const coarseBtn = document.getElementById("coarse-go");
-    const fineBtn = document.getElementById("fine-go");
     let pollTimer = null;
     let statusPoll = null;
     let previewTimer = null;
@@ -152,6 +153,9 @@
     function setStatus(text, kind) {
       statusEl.textContent = text || "";
       statusEl.className = kind || "";
+    }
+    function setBusy(busy) {
+      [planBtn, runBtn].forEach((b) => { if (b) b.disabled = !!busy; });
     }
     function renderCamera(cam) {
       if (!cam) {
@@ -168,7 +172,7 @@
       }
       if (cam.connected) {
         camBanner.className = "banner ok";
-        camBanner.textContent = `相机已连接（${cam.mode || "head"}）— 可识别抓取点`;
+        camBanner.textContent = `相机已连接（${cam.mode || "head"}）`;
         cameraConnected = true;
         return;
       }
@@ -179,7 +183,7 @@
     function renderRobot(robot) {
       if (!robot) {
         robotBanner.className = "banner err";
-        robotBanner.textContent = "机械臂未连接（看抓取点不需要）";
+        robotBanner.textContent = "机械臂未连接（只定位可不连）";
         robotConnected = false;
         return;
       }
@@ -191,36 +195,26 @@
       }
       if (robot.connected) {
         robotBanner.className = "banner ok";
-        robotBanner.textContent = `机械臂已连接 ${robot.ip || ""}（${robot.mode || "ok"}）— 可执行抓取`;
+        robotBanner.textContent = `机械臂已连接 ${robot.ip || ""}`;
         robotConnected = true;
         return;
       }
       robotBanner.className = "banner err";
-      const detail = robot.error ? `：${robot.error}` : "";
-      robotBanner.textContent = `机械臂未连接${detail}（看抓取点不需要）`;
+      robotBanner.textContent = "机械臂未连接" + (robot.error ? `：${robot.error}` : "");
       robotConnected = false;
     }
     function renderConfirm(s) {
       awaitingConfirm = !!(s && s.awaiting_confirm);
       if (awaitingConfirm) {
         confirmBanner.classList.add("show");
-        confirmText.textContent = (s.confirm_message || "已到接近位，可内收 5mm") +
-          (s.confirm_plan && s.confirm_plan.width_m != null
-            ? `　宽 ${(s.confirm_plan.width_m * 1000).toFixed(0)} mm`
-            : "") +
-          (s.inward_steps != null ? `　已内收 ${s.inward_steps} 步` : "");
-        headVis.src = "/api/confirm.jpg?t=" + Date.now();
-        visMeta.textContent = "大板接近位 · 点「内收 5mm」逐步夹近";
-        planBtn.disabled = true;
-        runBtn.disabled = true;
-        if (coarseBtn) coarseBtn.disabled = true;
-        if (fineBtn) fineBtn.disabled = true;
+        confirmText.textContent = s.confirm_message || "大板双臂已到接近位，可内收";
       } else {
         confirmBanner.classList.remove("show");
       }
     }
     async function getJSON(path) {
       const res = await fetch(path);
+      if (!res.ok) throw new Error(await res.text());
       return res.json();
     }
     async function post(path, body) {
@@ -229,57 +223,20 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body || {}),
       });
-      const data = await res.json();
-      if (!res.ok || data.ok === false) throw new Error(data.error || "请求失败");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || data.message || res.statusText);
+      }
       return data;
+    }
+    async function refreshPreview() {
+      if (showPlanImage || awaitingConfirm) return;
+      headVis.src = "/api/head.jpg?t=" + Date.now();
+      if (wristVis) wristVis.src = "/api/wrist.jpg?t=" + Date.now();
+      visMeta.textContent = "实时预览 " + new Date().toLocaleTimeString();
     }
     function stopPoll() {
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    }
-    function refreshPreview() {
-      if (awaitingConfirm) return;
-      if (!cameraConnected) return;
-      // 规划图只作一次性展示，不锁死预览；实时仍走 head.jpg
-      if (showPlanImage) {
-        showPlanImage = false;
-      }
-      headVis.src = "/api/head.jpg?t=" + Date.now();
-    }
-    headVis.onload = () => {
-      if (awaitingConfirm) return;
-      if (showPlanImage) visMeta.textContent = "抓取点规划图 " + new Date().toLocaleTimeString();
-      else visMeta.textContent = "头摄预览 " + new Date().toLocaleTimeString();
-    };
-    headVis.onerror = () => {
-      if (!awaitingConfirm && !showPlanImage)
-        visMeta.textContent = "预览失败（相机未就绪或占用）";
-    };
-
-    function setBusy(busy) {
-      planBtn.disabled = busy;
-      runBtn.disabled = busy;
-      if (coarseBtn) coarseBtn.disabled = busy;
-      if (fineBtn) fineBtn.disabled = busy;
-    }
-    function fmtXY(p) {
-      if (!p || p.length < 2) return "—";
-      return `(${Number(p[0]).toFixed(4)}, ${Number(p[1]).toFixed(4)})`;
-    }
-    function fmtPose(p) {
-      if (!p || !p.xyz || p.xyz.length < 3) return "—";
-      const rzDeg = (Number(p.rz) * 180 / Math.PI).toFixed(1);
-      const id = p.board_id != null ? ` ID${p.board_id}` : "";
-      return (
-        `xyz=(${Number(p.xyz[0]).toFixed(4)}, ${Number(p.xyz[1]).toFixed(4)}, ${Number(p.xyz[2]).toFixed(4)}) ` +
-        `rz=${rzDeg}°${id}`
-      );
-    }
-    function fmtXyzrpyMmDeg(arr) {
-      if (!arr || arr.length < 6) return "—";
-      return (
-        `(${Number(arr[0]).toFixed(1)},${Number(arr[1]).toFixed(1)},${Number(arr[2]).toFixed(1)},` +
-        `${Number(arr[3]).toFixed(1)},${Number(arr[4]).toFixed(1)},${Number(arr[5]).toFixed(1)})`
-      );
     }
     function flangeToMmDeg(h) {
       if (!h || h.length < 6) return null;
@@ -295,14 +252,16 @@
     function cliLine(arm, arr) {
       const csv = poseCsv(arr);
       if (!csv) return "—";
-      const a = arm || "left";
-      return `python -m rim_python.move_to_pose --arm ${a} --pose ${csv} --execute --allow-large`;
+      return `python -m rim_python.move_to_pose --arm ${arm || "left"} --pose ${csv} --execute --allow-large`;
+    }
+    function fmtXY(xy) {
+      if (!xy || xy.length < 2) return "—";
+      return `(${Number(xy[0]).toFixed(4)}, ${Number(xy[1]).toFixed(4)})`;
     }
     function renderPoseXy(result) {
       if (!poseXy || !result) return;
       const mode = result.grasp_mode || "?";
       const cli = result.cli || {};
-      // 大板：返回左右臂接近 + 合拢 tip 姿态
       if (mode === "large") {
         const la = result.left_approach_xyzrpy_mm_deg || flangeToMmDeg(result.left_approach);
         const ra = result.right_approach_xyzrpy_mm_deg || flangeToMmDeg(result.right_approach);
@@ -310,59 +269,51 @@
         const rg = result.right_grasp_xyzrpy_mm_deg || flangeToMmDeg(result.right_grasp);
         const curL = result.current_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange);
         const curR = result.current_right_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange_right);
-        const lines = [
-          `grasp_mode=large  ID=${result.target_board_id ?? "—"}  左(-90,0,rz) 右(+90,0,-rz) 中间线⊥P0→P3  （不动臂）`,
+        poseXy.textContent = [
+          `grasp_mode=large  ID=${result.target_board_id ?? "—"}`,
+          ``,
+          `# 当前左/右`,
+          cli.current_left || cliLine("left", curL),
+          cli.current_right || cliLine("right", curR),
+          ``,
+          `# 接近`,
+          cli.left_approach || cliLine("left", la),
+          cli.right_approach || cliLine("right", ra),
+          ``,
+          `# tip`,
+          cli.left_grasp || cliLine("left", lg),
+          cli.right_grasp || cliLine("right", rg),
+        ].join("\n");
+        return;
+      }
+      if (mode === "large_single") {
+        const curL = result.current_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange);
+        const stop = result.fine_xyzrpy_mm_deg || flangeToMmDeg(result.fine_flange);
+        poseXy.textContent = [
+          `grasp_mode=large_single  ID=${result.target_board_id ?? "—"}  （腕粗，无头）`,
           ``,
           `# 当前左臂`,
           cli.current_left || cli.current || cliLine("left", curL),
-          `# 当前右臂`,
-          cli.current_right || cliLine("right", curR),
           ``,
-          `# 左臂接近（外侧外开 · 末端竖直向下）`,
-          cli.left_approach || cliLine("left", la),
-          `# 右臂接近（外侧外开 · 末端竖直向下）`,
-          cli.right_approach || cliLine("right", ra),
-          ``,
-          `# 左臂合拢 tipL=mid(P0,P3)`,
-          cli.left_grasp || cliLine("left", lg),
-          `# 右臂合拢 tipR`,
-          cli.right_grasp || cliLine("right", rg),
-        ];
-        poseXy.textContent = lines.join("\n");
+          `# 停 mid23`,
+          cli.fine || cliLine("left", stop),
+        ].join("\n");
         return;
       }
-      // 小板：原单臂粗悬停 + 精定位（同时打印左右当前）
       const arm = cli.arm || "left";
       const curL = result.current_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange);
-      const curR = result.current_right_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange_right);
       const coarse = result.coarse_xyzrpy_mm_deg || flangeToMmDeg(result.hover_flange);
       const fine = result.fine_xyzrpy_mm_deg || flangeToMmDeg(result.fine_flange);
-      const curLeftCmd = cli.current_left || cliLine("left", curL);
-      const curRightCmd = cli.current_right || cliLine("right", curR);
-      const curCmd = cli.current || (arm === "right" ? curRightCmd : curLeftCmd);
-      const coarseCmd = cli.coarse || cliLine(arm, coarse);
-      const fineCmd = cli.fine || cliLine(arm, fine);
-      const lines = [
-        `grasp_mode=${mode}  ID=${result.target_board_id ?? "—"}  arm=${arm}  （不动臂）`,
+      poseXy.textContent = [
+        `grasp_mode=${mode}  ID=${result.target_board_id ?? "—"}  arm=${arm}`,
         ``,
-        `# 当前左臂`,
-        curLeftCmd,
-        `# 当前右臂`,
-        curRightCmd,
-        ``,
-        `# 粗定位 · 末端=相机竖直向下`,
-        coarseCmd,
-        ``,
-        `# 精定位 · 末端=(-90,0,rz) · z=标定抓取高+10cm`,
-        fineCmd,
-      ];
-      if (result.dxy_mm) {
-        lines.push(
-          ``,
-          `Δxy粗→精 = (${result.dxy_mm.dx}, ${result.dxy_mm.dy}) mm  |Δ|=${result.dxy_mm.hypot} mm`
-        );
-      }
-      poseXy.textContent = lines.join("\n");
+        `# 当前`,
+        cli.current || cliLine(arm, curL),
+        `# 粗悬停`,
+        cli.coarse || cliLine(arm, coarse),
+        `# 精 / 抓取高`,
+        cli.fine || cliLine(arm, fine),
+      ].join("\n");
     }
     function renderPlanXy(result) {
       if (!planXy || !result) return;
@@ -371,39 +322,27 @@
       const print = dbg.print_xy || (dbg.plan ? {
         mid_mode: dbg.plan.mid_mode,
         p0_xy: dbg.plan.p0_xy,
+        p2_xy: dbg.plan.p2_xy,
         p3_xy: dbg.plan.p3_xy,
         tip_left_xy: dbg.plan.tip_left_xy,
         tip_right_xy: dbg.plan.tip_right_xy,
         grasp_z_m: dbg.plan.grasp_z_m,
-        tip_span_m: dbg.plan.tip_span_m,
-        width_m: dbg.plan.width_m,
-        calib_pending: dbg.plan.calib_pending,
       } : null);
       if (!print) {
-        if (result.coarse) {
-          planXy.textContent =
-            `grasp_mode=${result.grasp_mode || "?"}\n` +
-            `coarse_xy=(${Number(result.coarse.xyz[0]).toFixed(4)}, ${Number(result.coarse.xyz[1]).toFixed(4)})\n` +
-            `(小板详情见上方「粗定位/精定位」；大板识别后显示 tip)`;
-        }
+        planXy.textContent = result.coarse
+          ? `grasp_mode=${result.grasp_mode || "?"}\ncoarse_xy=(${Number(result.coarse.xyz[0]).toFixed(4)}, ${Number(result.coarse.xyz[1]).toFixed(4)})`
+          : "—";
         return;
       }
-      const spanMm = print.width_m != null ? (print.width_m * 1000).toFixed(1) : "?";
-      const z = print.grasp_z_m != null ? Number(print.grasp_z_m).toFixed(4)
-        : (dbg.plan && dbg.plan.tip_left ? Number(dbg.plan.tip_left[2]).toFixed(4) : "?");
+      const z = print.grasp_z_m != null ? Number(print.grasp_z_m).toFixed(4) : "?";
       planXy.textContent =
-        `mid_mode=${print.mid_mode || "base_xy"}  （基座坐标 XY 中点，不是像素）\n` +
-        `P0_xy = ${fmtXY(print.p0_xy)}\n` +
-        `P3_xy = ${fmtXY(print.p3_xy)}\n` +
-        `tipL_xy = ${fmtXY(print.tip_left_xy)}   ← mid(P0,P3)\n` +
-        `tipR_xy = ${fmtXY(print.tip_right_xy)}\n` +
-        `tip_span = ${spanMm} mm` +
-        (print.tip_span_m != null ? ` (标定 tip_span_m=${print.tip_span_m})` : " (视觉，待标定 tip_span_m)") + `\n` +
-        `grasp_z = ${z} m` +
-        (print.grasp_z_m != null ? " (标定)" : " (视觉/暂用，待标定 grasp_z_m)") + `\n` +
-        `calib_pending=${!!print.calib_pending}\n` +
-        `接近：同高 tip 左右各外开 open_margin（默认 5cm）→ 确认抓取再合拢\n` +
-        `合拢力阈: squeeze_force_n（同托盘；RIM 暂无力控则慢速到位）`;
+        `mid_mode=${print.mid_mode || "?"}\n` +
+        (print.p2_xy ? `P2_xy = ${fmtXY(print.p2_xy)}\n` : "") +
+        (print.p3_xy ? `P3_xy = ${fmtXY(print.p3_xy)}\n` : "") +
+        (print.p0_xy ? `P0_xy = ${fmtXY(print.p0_xy)}\n` : "") +
+        `tipL_xy = ${fmtXY(print.tip_left_xy)}\n` +
+        (print.tip_right_xy ? `tipR_xy = ${fmtXY(print.tip_right_xy)}\n` : "") +
+        `grasp_z = ${z} m`;
     }
 
     async function pollJob() {
@@ -413,13 +352,16 @@
       renderConfirm(s);
       if (s.running) {
         setBusy(true);
-        // 运动中也刷新粗/精坐标（服务端在开始移动前就会推 result）
         if (s.result) {
           out.textContent = JSON.stringify(s.result, null, 2);
           renderPlanXy(s.result);
         }
         if (!s.awaiting_confirm) setStatus("运行中… " + (s.message || s.batch_dir || ""), "run");
         else setStatus(s.confirm_message || "大板可内收…", "run");
+        if (s.has_wrist_vis && wristVis) {
+          wristVis.src = "/api/wrist.jpg?t=" + Date.now();
+          if (wristMeta) wristMeta.textContent = "腕部 " + new Date().toLocaleTimeString();
+        }
         return;
       }
       stopPoll();
@@ -429,10 +371,11 @@
         out.textContent = JSON.stringify(s.result, null, 2);
         renderPlanXy(s.result);
         if (s.result.debug && s.result.debug.stage === "plan_only") {
-          // 先闪一张带抓取点的规划图，随后 refreshPreview 恢复实时头摄
           showPlanImage = true;
           headVis.src = "/api/confirm.jpg?t=" + Date.now();
-          visMeta.textContent = "抓取点规划图（即将恢复实时预览）";
+          visMeta.textContent = "定位结果图（即将恢复预览）";
+          if (wristVis) wristVis.src = "/api/wrist.jpg?t=" + Date.now();
+          setTimeout(() => { showPlanImage = false; }, 4000);
         }
       }
       if (s.ok === true) setStatus(s.message || "完成", "ok");
@@ -463,23 +406,7 @@
       try {
         await startJob(
           { plan_only: true, real: false, stage: "all" },
-          "识别抓取点中（不动臂）…"
-        );
-      } catch (e) { setStatus(e.message, "err"); }
-    };
-    document.getElementById("coarse-go").onclick = async () => {
-      try {
-        await startJob(
-          { plan_only: true, real: false, stage: "coarse" },
-          "粗定位识别中（不动臂）→ 打印当前/粗定位 xyzrpy…"
-        );
-      } catch (e) { setStatus(e.message, "err"); }
-    };
-    document.getElementById("fine-go").onclick = async () => {
-      try {
-        await startJob(
-          { plan_only: true, real: false, stage: "fine" },
-          "精定位识别中（不动臂）→ 打印当前/粗/精 xyzrpy…"
+          "只定位中（不动臂）…"
         );
       } catch (e) { setStatus(e.message, "err"); }
     };
@@ -489,19 +416,19 @@
           setStatus("全流程请先「连接机械臂」", "err");
           return;
         }
-        await startJob(
-          { plan_only: false, real: true, stage: "all" },
-          "全流程：头粗 → 接近 →（大板可内收 / 小板腕精）…"
-        );
+        const force = document.getElementById("force").value;
+        const msg = force === "large_single"
+          ? "全流程·单臂：腕粗 → 精 P2/P3 → 停 mid23…"
+          : force === "large"
+            ? "全流程·双臂：头粗 → 腕精 → 接近 mid23+dx/±dy…"
+            : "全流程…";
+        await startJob({ plan_only: false, real: true, stage: "all" }, msg);
       } catch (e) { setStatus(e.message, "err"); }
     };
     async function doInward() {
       try {
         const data = await post("/api/inward", {});
-        setStatus(
-          data.message || `内收 ×${data.n}（${data.step_mm}mm）`,
-          data.ok ? "ok" : "err"
-        );
+        setStatus(data.message || `内收 ×${data.n}`, data.ok ? "ok" : "err");
         pollJob();
       } catch (e) { setStatus(e.message, "err"); }
     }
@@ -555,10 +482,7 @@
         if (c.robot) renderRobot(c.robot);
         document.getElementById("hint").textContent =
           `cls 小板=${c.classes.pcb_small} nopcb=${c.classes.nopcb} 大板=${c.classes.pcb_large}；` +
-          `悬停 ${ (c.hover_height_m*100).toFixed(0)}cm；grasp_z=${c.grasp_z_m ?? "未示教"}；` +
-          `大板接近外开${(c.open_margin_m*1000).toFixed(0)}mm→内收5mm步进（无自动合拢）；` +
-          `robot_ip=${c.robot_ip}`;
-        renderResetHint(c.reset_pose);
+          `grasp_z=${c.grasp_z_m ?? "未示教"}；robot_ip=${c.robot_ip}`;
         setStatus("配置已重载", "ok");
       } catch (e) { setStatus(e.message, "err"); }
     };
@@ -569,47 +493,6 @@
         confirmBanner.classList.remove("show");
         awaitingConfirm = false;
       } catch (e) { setStatus(e.message, "err"); }
-    };
-
-    function renderResetHint(rp) {
-      const el = document.getElementById("reset-hint");
-      if (!el) return;
-      if (!rp || !rp.xyz_m) {
-        el.textContent = "复位位：未记录（记当前 XYZ，姿态固定 rpy=-90°/0°/0°）";
-        return;
-      }
-      const xyz = rp.xyz_m.map((v) => Number(v).toFixed(3)).join(", ");
-      const rpy = (rp.rpy_deg || [-90, 0, 0]).map((v) => Number(v).toFixed(1)).join(", ");
-      el.textContent = `复位位：xyz=(${xyz})  rpy_deg=(${rpy})`;
-    }
-    document.getElementById("save-reset").onclick = async () => {
-      try {
-        if (!robotConnected) throw new Error("请先连接机械臂");
-        setStatus("正在记录当前末端为复位位…", "run");
-        const data = await post("/api/reset_pose", { action: "capture" });
-        renderResetHint(data.reset_pose);
-        setStatus(data.message || "已记为复位位", "ok");
-      } catch (e) { setStatus(e.message, "err"); }
-    };
-    document.getElementById("go-reset").onclick = async () => {
-      try {
-        if (!robotConnected) throw new Error("请先连接机械臂");
-        setStatus("正在复位（先抬高→转姿态→再回复位位）…", "run");
-        const data = await post("/api/reset_pose", { action: "go" });
-        renderResetHint(data.reset_pose);
-        setStatus(data.message || "复位完成", "ok");
-        if (data.after) {
-          out.textContent = JSON.stringify(
-            { reset: data.reset_pose, after: data.after },
-            null,
-            2
-          );
-        }
-      } catch (e) {
-        const msg = (e && e.message) ? String(e.message) : String(e);
-        setStatus("复位失败: " + msg, "err");
-        if (out) out.textContent = "复位失败:\n" + msg;
-      }
     };
 
     document.getElementById("reload").click();

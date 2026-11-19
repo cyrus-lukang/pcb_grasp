@@ -5,10 +5,10 @@
 models:
   # 粗定位：头鱼眼 YOLO-Pose · 3cls（PCB小板=0 + 空槽nopcb=1 + PCB大板=2）· 20261105
   # run: yolopose_3cls_20261105163435_041ee5 · PCB小板+空槽(nopcb)+PCB大板
-  head_pose_weights: models/yolopose/yolopose_3cls_20261105163435_041ee5/best.pt
-  # 精定位：腕部 YOLO-Pose · 26x wrist（imgsz=960）
-  # run: yolo_pose_26x_wrist_0821_0703_0707_960_0827_1613
-  wrist_pose_weights: /home/ubuntu/workspace/perception/projects/yuantu/weights/yolo_pose_26x_wrist_0821_0703_0707_960_0827_1613/weights/best.pt
+  head_pose_weights: /home/ubuntu/workspace/pcb_grasp/models/yolopose/yolopose_3cls_20261105163435_041ee5/best.pt
+  # 精定位（小板）：腕部 YOLO-Pose · 江源杯 26x wrist（非昨天 b6aa78）
+  # 按头粗 cls 选：small → 本权重；large → large_board.wrist_pose_weights
+  wrist_pose_weights: /home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/models/yolopose/yolopose_wrist_jiangyuan_0827_1613/best.pt
   # 精定位外轮廓模板（关键点定方向 + Chamfer 微调）
   shape_model: TCT/shape_match/models/d435_pcb.npz
 
@@ -27,16 +27,16 @@ classes:
   pcb_large: 2
 
 # 大板双臂对夹（流程对齐托盘 UI：识别 → 接近外开 → 确认抓取 → 合拢）
-# 左 tip=基座XY mid(P0,P3)；右 tip 沿法向 span；mid 是基座坐标不是像素。
-# 头定位：不用 FFS 角点深度；四角射线 ∩ 固定板面 Z（标定 tip 高度 = 板面高度）。
+# 精 P2/P3 → tip=mid23 后 x+=dx、左 y+=dy、右 y-=dy；rz∥P2→P3。
+# 头定位：四角射线 ∩ 固定板面 Z（标定 tip/板面高）。
 large_board:
   enable: true
-  # TCP=夹爪 tip：XY/Z 偏移均为 0（旧 tool_y/tool_z 会把接近位沿法向再偏一截）
+  # TCP=夹爪 tip：XY/Z 偏移均为 0
   tool_y_m: 0.0
   tool_z_m: 0.0
-  # 接近位：相对 tip 各外开（同高），默认 5cm；左 tip 贴视觉左边，外开后离边有空
-  open_margin_m: 0.05
-  # 合拢额外内收；标定 tip_span_m 后建议 0（固定间距停下，靠力阈贴实）
+  # 接近外开；新策略 dx/±dy 已含左右分开，默认 0
+  open_margin_m: 0.0
+  # 合拢额外内收；建议 0（靠力阈贴实）
   squeeze_close_m: 0.0
   squeeze_velocity_scale: 0.01
   # 阻抗/遇阻停力阈（N）；合拢靠双臂位移，不收夹爪（RIM 暂退化慢速到位）
@@ -48,22 +48,41 @@ large_board:
   # 基座 tip Z（米）= 头定位固定板面；2026-11-16 左臂 TCP 示教后再降 5mm
   # 详见 config/large_grasp_z.json
   grasp_z_m: 0.73804
-  # tip_span_m：右 tip 相对左 tip 的固定间距（米）
-  # 实测夹持约 43cm；全流程目标用 47cm（左贴边，右=左+47，右臂不易撞边）
+  # tip_span_m：旧字段（左贴边+span）；现接近改用 approach_dx/dy，可留作兼容
   tip_span_m: 0.47
   hover_z_m: null
   approach_velocity_scale: 0.08
-  half_width_m: null       # 兼容旧半宽；优先 tip_span_m
+  half_width_m: null
   # True：大板角点用固定板面求交（板面 Z=tipZ）；False 才走头深/托盘混用
   use_fixed_grasp_z_plane: true
-  # 大板：rx=-90 与小板相同；rz=夹爪中间线⊥P0→P3（小板 rz 则∥P0→P1，勿混用）
-  orient_edge: perp_p0p3
+  # 大板：rz=夹爪中间线∥P2→P3（23⊥03；勿再用 ⊥P0→P3）
+  orient_edge: parallel_p2p3
   # 额外 rz 偏置（度），装夹爪偏了可微调
   orient_rz_offset_deg: 0.0
+  # 接近 tip：mid(P2,P3) 后 x+=dx；左 y+=dy、右 y-=dy（基座：左+Y / 右−Y）
+  approach_dx_m: 0.16
+  approach_dy_m: 0.25
+  # —— 腕部精定位：左臂→P3上方 → 回粗；右臂→P2上方 → 回粗；合成精2/3 ——
+  fine_enable: true
+  # 腕部大板角点：YOLO-Pose · corner · 84d205（与小板腕模分开）
+  wrist_pose_weights: /home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/models/yolopose/yolopose_corner_20261119111231_84d205/best.pt
+  fine_hover_height_m: 0.10   # 腕相机光心相对板面高度（米）= 上方 10cm
+  fine_match_max_dist_m: 0.15 # 腕精相对粗角点/板心匹配阈值
+
+  # —— 单臂支路 B（无头；腕粗 → 左精 P2/P3 → 停 mid23）——
+  # 平台选 force=large_single 进入；位姿/高度占位，后面你写死
+  single_arm:
+    enable: true
+    # 粗定位前左臂固定法兰 [x,y,z,rx,ry,rz] 米/弧度；null=暂用当前 TCP
+    coarse_flange_pose: null
+    # 精定位悬停高度（相对板面）；null=复用上面 fine_hover_height_m
+    fine_hover_height_m: null
+    # 精定位结束后停在 mid(P2,P3) 的相机 Z（基座）；null=后面写死（暂不强制落到固定高）
+    stop_z_m: null
 
 calib:
   stereo_calib_json: calib/stereo/stereo_calib.json
-  stereo_maps_yml: calib/stereo/stereo_maps_raw.yml
+  stereo_maps_yml: /home/ubuntu/workspace/pcb_grasp/calib/stereo/stereo_maps_raw.yml
   # 眼在手外：头左鱼眼 → Link_Base
   # 来源: lk_Perception/.../results/20261109_170058_head_fisheye_oct29style/dual_arm_six_camera_handeye.yaml
   #        cameras.head_fisheye_left.matrix · Tsai · n=16
@@ -82,12 +101,13 @@ calib:
     - [-0.010305485473285414, -0.26689119261767047, 0.9636715665994704, -0.13623085091056364]
     - [-0.9996935546388147, -0.018942382371413824, -0.015936842965480036, 0.009649814255459525]
     - [0.0, 0.0, 0.0, 1.0]
-  # 右腕备用（arm B）：.../right_wrist_1_handeye.yaml · CV3H761000XG / cam15
-  # T_tool_cam_right:
-  #   - [0.012814399993113179, 0.9647982705560006, 0.26267867877878187, -0.08584363273585255]
-  #   - [0.0003688328139679342, 0.2626956699016061, -0.9648786705992114, 0.1389369718434879]
-  #   - [-0.9999178241811533, 0.012461225746144888, 0.003010438129537496, 0.010925959852390895]
-  #   - [0.0, 0.0, 0.0, 1.0]
+  # 右腕（arm B / cam15）：大板精定位看 P2
+  # 来源: calib/handeye/right_wrist_1_handeye.yaml · CV3H761000XG
+  T_tool_cam_right:
+    - [0.012814399993113179, 0.9647982705560006, 0.26267867877878187, -0.08584363273585255]
+    - [0.0003688328139679342, 0.2626956699016061, -0.9648786705992114, 0.1389369718434879]
+    - [-0.9999178241811533, 0.012461225746144888, 0.003010438129537496, 0.010925959852390895]
+    - [0.0, 0.0, 0.0, 1.0]
   # 左腕 RGB 内参 1280x800 · BROWN_CONRADY_K6（Orbbec EEPROM）
   wrist_intrinsics:
     fx: 615.039856
@@ -104,8 +124,8 @@ calib:
 
 # 头部深度 = 双目 Fast-FoundationStereo（不是 RealSense）
 depth:
-  ffs_weights: models/ffs/model_best_bp2_serialize.pth
-  ffs_cfg: models/ffs/cfg.yaml
+  ffs_weights: /home/ubuntu/workspace/pcb_grasp/models/ffs/model_best_bp2_serialize.pth
+  ffs_cfg: /home/ubuntu/workspace/pcb_grasp/models/ffs/cfg.yaml
 
 detect:
   head_conf: 0.4
@@ -119,7 +139,8 @@ detect:
   head_class_ids: null
   kp_i: 0
   kp_j: 1
-  n_frames: 5
+  # 粗/精均采 N 帧 → MAD 滤异常 → 取最接近平均位置的那一帧真实样本
+  n_frames: 10
   outlier_mad_k: 3.0
   frame_gap_s: 0.03
 

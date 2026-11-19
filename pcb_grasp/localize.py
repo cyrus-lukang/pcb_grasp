@@ -47,6 +47,35 @@ def pixel_to_cam(u: float, v: float, z_m: float, K: Intrinsics) -> np.ndarray:
     )
 
 
+def base_xyz_to_cam(
+    xyz_base: Sequence[float],
+    *,
+    T_base_cam: np.ndarray,
+) -> np.ndarray:
+    """基座 XYZ → 头相机坐标系（``T_base_cam`` 为 cam→base 外参，取逆）。"""
+    T = np.asarray(T_base_cam, dtype=np.float64).reshape(4, 4)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    p = np.asarray(xyz_base[:3], dtype=np.float64)
+    return R.T @ (p - t)
+
+
+def base_xyz_to_pixel(
+    xyz_base: Sequence[float],
+    *,
+    K: Intrinsics,
+    T_base_cam: np.ndarray,
+) -> tuple[float, float] | None:
+    """反向手眼：基座抓取点 → 头相机校正图像素。相机后方则返回 None。"""
+    p_cam = base_xyz_to_cam(xyz_base, T_base_cam=T_base_cam)
+    z = float(p_cam[2])
+    if z <= 1e-4:
+        return None
+    u = float(K.fx) * float(p_cam[0]) / z + float(K.cx)
+    v = float(K.fy) * float(p_cam[1]) / z + float(K.cy)
+    return u, v
+
+
 def pixel_to_base_on_plane(
     u: float,
     v: float,
