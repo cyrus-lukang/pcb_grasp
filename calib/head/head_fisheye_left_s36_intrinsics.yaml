@@ -1,0 +1,23 @@
+serial: head_fisheye_left_s36
+model: pinhole
+image_width: 1920
+image_height: 1536
+camera_matrix:
+- - 1017.7614192849
+  - 0.0
+  - 962.4098492986
+- - 0.0
+  - 1017.8722448879
+  - 768.0641847886
+- - 0.0
+  - 0.0
+  - 1.0
+distortion_coefficients:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+realsense_distortion_model: ''
+source_file: ''
+depth_scale: null

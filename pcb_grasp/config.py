@@ -27,6 +27,12 @@ class GraspConfig:
     shape_score_thresh: float = 5.2
     stereo_calib_json: str = ""
     stereo_maps_yml: str = ""
+    # 头定位用内参 yaml（camera_matrix）；有则覆盖 stereo K_rect，与手眼一致
+    head_intrinsics_yaml: str = ""
+    head_fx: float | None = None
+    head_fy: float | None = None
+    head_cx: float | None = None
+    head_cy: float | None = None
     T_base_cam: np.ndarray = field(default_factory=lambda: np.eye(4))
     T_tool_cam: np.ndarray = field(default_factory=lambda: np.eye(4))
     T_tool_cam_right: np.ndarray | None = None  # 右腕手眼；大板精定位看 P2
@@ -117,19 +123,21 @@ class GraspConfig:
     # head_source: portal = rim watch portal（与 capture_images 同源）；v4l2 = 本机 /dev/video*
     cam_head_source: str = "portal"
     cam_portal: str = "10.3.8.7:8787"
-    cam_portal_head_left_id: int = 0
-    cam_portal_head_right_id: int = 1
+    cam_portal_head_left_id: int = 7
+    cam_portal_head_right_id: int = 6
     cam_portal_max_hz: float = 8.0
     cam_portal_timeout_s: float = 60.0
-    cam_head_left: str = "/dev/video6"
-    cam_head_right: str = "/dev/video7"
+    cam_head_left: str = "/dev/video7"
+    cam_head_right: str = "/dev/video6"
     cam_head_width: int = 1920
     cam_head_height: int = 1536
     cam_s36_sdk: str = "/home/ubuntu/workspace/ccg3_8m_sdk/ccg3_camera_python"
     # wrist_source: portal=Gemini305 门户；d405=本机 RealSense
     cam_wrist_source: str = "portal"
-    cam_portal_wrist_id: int = 13  # 13=左腕305；15=右腕305
-    cam_portal_wrist_depth_id: int = 12  # Z16：左腕12 / 右腕14
+    cam_portal_wrist_id: int = 1  # 左臂彩色
+    cam_portal_wrist_depth_id: int = 0  # 左臂 Z16
+    cam_portal_wrist_right_id: int = 3  # 右臂彩色
+    cam_portal_wrist_right_depth_id: int = 2  # 右臂 Z16
     cam_wrist_need_depth: bool = True
     cam_wrist_undistort: bool = True
     cam_wrist_serial: str = "262422274334"  # 仅 d405
@@ -167,20 +175,27 @@ class GraspConfig:
     large_hover_z_m: float | None = None
     large_approach_velocity_scale: float = 0.08
     large_half_width_m: float | None = None
-    # 大板头定位：四角射线 ∩ 固定板面 Z（grasp_z；未标定则 head_tray_z）
-    large_use_fixed_grasp_z_plane: bool = True
-    # True：两臂夹取法兰 Z 取左臂当前高度
-    large_use_left_current_z: bool = True
+    # 大板头定位：False=头 FFS 角点 Z（默认）；True=射线∩固定板面
+    large_use_fixed_grasp_z_plane: bool = False
+    # True：夹取 tipZ = 左臂当前法兰 Z − below（大板已弃用，改用 FFS）
+    large_use_left_current_z: bool = False
+    large_grasp_z_below_left_m: float = 0.0
     # 大板末端 rz：parallel_p2p3=夹爪中间线∥P2→P3（默认；23⊥03）
     large_orient_edge: str = "parallel_p2p3"
     large_orient_rz_offset_deg: float = 0.0
     # 接近：mid(P2,P3) 后 x+=dx；左 y+=dy、右 y-=dy（基座系右臂 Y 为负侧）
-    large_approach_dx_m: float = 0.16
-    large_approach_dy_m: float = 0.25
+    large_approach_dx_m: float = 0.15
+    large_approach_dy_m: float = 0.08
     # 大板腕部精定位：左看 P3、右看 P2（上方 hover）→ 合成精 2/3
     large_fine_enable: bool = True
     large_wrist_pose_weights: str = ""
-    large_fine_hover_height_m: float = 0.10
+    # V2·220e76 单角模型：训练 imgsz=480、每框 1 关键点（勿用小板 wrist_imgsz=960 / n_corners=4）
+    large_wrist_imgsz: int = 480
+    large_wrist_n_corners: int = 1
+    large_coarse_hover_height_m: float = 0.35
+    large_fine_hover_height_m: float = 0.35
+    # 接近停靠相对板面抬高；None → 复用 large_fine_hover_height_m
+    large_approach_hover_height_m: float | None = None
     large_fine_match_max_dist_m: float = 0.15
     # 大板单臂支路 B：无头相机；腕部粗定位 → 左臂精看 P2/P3 → 停 mid23
     large_single_enable: bool = True
@@ -267,6 +282,22 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     cfg.stereo_maps_yml = _resolve_path(
         root, str(g("calib", "stereo_maps_yml", default="") or "")
     )
+    hi_path = str(g("calib", "head_intrinsics_yaml", default="") or "").strip()
+    cfg.head_intrinsics_yaml = _resolve_path(root, hi_path) if hi_path else ""
+    if cfg.head_intrinsics_yaml and Path(cfg.head_intrinsics_yaml).is_file():
+        try:
+            import yaml
+
+            hi = yaml.safe_load(Path(cfg.head_intrinsics_yaml).read_text(encoding="utf-8")) or {}
+            Km = hi.get("camera_matrix") or hi.get("K")
+            if Km is not None:
+                K = np.asarray(Km, dtype=np.float64).reshape(3, 3)
+                cfg.head_fx = float(K[0, 0])
+                cfg.head_fy = float(K[1, 1])
+                cfg.head_cx = float(K[0, 2])
+                cfg.head_cy = float(K[1, 2])
+        except Exception:
+            pass
 
     Tbc = g("calib", "T_base_cam")
     if Tbc is not None:
@@ -442,6 +473,12 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     cfg.cam_portal_wrist_depth_id = int(
         cam.get("portal_wrist_depth_id", cfg.cam_portal_wrist_depth_id)
     )
+    cfg.cam_portal_wrist_right_id = int(
+        cam.get("portal_wrist_right_id", cfg.cam_portal_wrist_right_id)
+    )
+    cfg.cam_portal_wrist_right_depth_id = int(
+        cam.get("portal_wrist_right_depth_id", cfg.cam_portal_wrist_right_depth_id)
+    )
     cfg.cam_wrist_need_depth = bool(
         cam.get("wrist_need_depth", cfg.cam_wrist_need_depth)
     )
@@ -489,6 +526,9 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     cfg.large_use_left_current_z = bool(
         lb.get("use_left_current_z", cfg.large_use_left_current_z)
     )
+    cfg.large_grasp_z_below_left_m = float(
+        lb.get("grasp_z_below_left_m", cfg.large_grasp_z_below_left_m)
+    )
     cfg.large_orient_edge = str(
         lb.get("orient_edge", cfg.large_orient_edge) or "parallel_p2p3"
     ).strip().lower()
@@ -507,8 +547,22 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
         cfg.large_wrist_pose_weights = ""
     else:
         cfg.large_wrist_pose_weights = _resolve_path(root, str(wpath))
+    cfg.large_wrist_imgsz = int(
+        lb.get("wrist_imgsz", cfg.large_wrist_imgsz) or cfg.large_wrist_imgsz
+    )
+    cfg.large_wrist_n_corners = int(
+        lb.get("wrist_n_corners", cfg.large_wrist_n_corners)
+        or cfg.large_wrist_n_corners
+    )
+    cfg.large_coarse_hover_height_m = float(
+        lb.get("coarse_hover_height_m", cfg.large_coarse_hover_height_m)
+    )
     cfg.large_fine_hover_height_m = float(
         lb.get("fine_hover_height_m", cfg.large_fine_hover_height_m)
+    )
+    ah = lb.get("approach_hover_height_m", cfg.large_approach_hover_height_m)
+    cfg.large_approach_hover_height_m = (
+        None if ah in (None, "null", "") else float(ah)
     )
     cfg.large_fine_match_max_dist_m = float(
         lb.get("fine_match_max_dist_m", cfg.large_fine_match_max_dist_m)

@@ -34,7 +34,7 @@ def main() -> int:
     ap.add_argument(
         "--calib",
         type=Path,
-        default=ROOT / "calib" / "stereo" / "stereo_calib.json",
+        default=ROOT / "calib" / "stereo" / "stereo_calib_cam6.json",
     )
     ap.add_argument("--out", type=Path, default=Path("/tmp/head_depth_check"))
     ap.add_argument("--already-rectified", action="store_true")

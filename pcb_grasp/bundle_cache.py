@@ -5,8 +5,8 @@
 ``10.3.8.7:50066``），用 perception SDK 子进程拉 JPEG/深度。
 
 对外 API 对齐 ``PortalFrameCache``，方便头/腕相机无缝切换。
-深度 cam_id：Gemini305 彩色 13/15 对应 Z16 12/14；缓存里会把深度
-**回写到彩色 cam_id**，以便 ``WristPortalCam.wait_color_depth(13)`` 仍可用。
+深度 cam_id：左臂彩色 1 对应 Z16 0，右臂彩色 3 对应 Z16 2；缓存里会把深度
+**回写到彩色 cam_id**，以便 ``WristPortalCam.wait_color_depth(1)`` 仍可用。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ _WORKER = Path(__file__).resolve().parent / "bundle_worker.py"
 DEFAULT_BUNDLE = "10.3.8.7:50066"
 
 # 彩色 → 深度（frame_bundle 实际编号）
-_DEFAULT_DEPTH_OF_COLOR = {13: 12, 15: 14}
+_DEFAULT_DEPTH_OF_COLOR = {1: 0, 3: 2}
 
 
 def _sdk_python() -> str:
@@ -211,7 +211,7 @@ class BundleFrameCache:
     def _color_ids(self) -> list[int]:
         if self.wanted:
             return sorted(self.wanted)
-        return [0, 1, 13]
+        return [1, 3, 6, 7]
 
     def _depth_ids(self) -> list[int]:
         ids: list[int] = []

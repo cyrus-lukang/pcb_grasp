@@ -19,6 +19,8 @@ class HeadRectifyMaps:
     map2y: np.ndarray | None
     K_rect: np.ndarray  # 3x3 for left after rectify (dist=0)
     image_size: tuple[int, int]  # (w, h)
+    # 左目校正旋转：p_rect = R1 @ p_cam。手眼在 7 号原相机，抬点要乘 R1.T。
+    R1: np.ndarray | None = None
 
     def undistort_left(self, bgr: np.ndarray) -> np.ndarray:
         return cv2.remap(bgr, self.map1x, self.map1y, cv2.INTER_LINEAR)
@@ -92,7 +94,18 @@ def build_maps_from_stereo_json(
         map2y=map2y,
         K_rect=K_rect,
         image_size=size,
+        R1=np.asarray(r1, dtype=np.float64).reshape(3, 3).copy(),
     )
+
+
+def T_base_from_rectified(T_base_cam: np.ndarray, R1: np.ndarray | None) -> np.ndarray:
+    """手眼 ``T_base_cam`` 是 7 号原相机。校正点 ``p_rect = R1 @ p_cam7``。"""
+    T_cam = np.asarray(T_base_cam, dtype=np.float64).reshape(4, 4)
+    if R1 is None:
+        return T_cam.copy()
+    T_rect_to_cam = np.eye(4, dtype=np.float64)
+    T_rect_to_cam[:3, :3] = np.asarray(R1, dtype=np.float64).reshape(3, 3).T
+    return T_cam @ T_rect_to_cam
 
 
 def load_maps_from_yml(path: str | Path, K_rect: np.ndarray | None = None) -> HeadRectifyMaps:

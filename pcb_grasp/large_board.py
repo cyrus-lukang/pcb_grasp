@@ -1,11 +1,11 @@
 """Large PCB dual-arm squeeze.
 
-精定位后：用精 P2/P3。
-- rz：夹爪中间线 **∥ P2→P3**（23 ⊥ 03，故不再用 ⊥P0→P3）
-- 接近 tip：基座 XY ``mid(P2,P3)``，再 ``x+=dx``、左 ``y+=dy``、右 ``y-=dy``
-  （基座系左臂 +Y、右臂 −Y）
+精定位后：用腕部精 P2/P3。
+- rz：夹爪中间线 **∥ P2→P3**
+- 接近 tip（相对各自角点）：
+  左 tip = (P3.x+dx, P3.y+dy, z)；右 tip = (P2.x+dx, P2.y−dy, z)
+  默认 dx=0.10、dy=0.08（基座：左 +Y 外、右 −Y 外）
 - Z：标定 grasp_z_m
-小板逻辑不动。
 """
 
 from __future__ import annotations
@@ -43,12 +43,12 @@ class LargeBoardPlan:
     p0_xy: list[float] = field(default_factory=list)
     p2_xy: list[float] = field(default_factory=list)
     p3_xy: list[float] = field(default_factory=list)
-    mid_mode: str = "mid_p2p3_fixed_xy_offset"
+    mid_mode: str = "corner_p2p3_xy_offset"
     grasp_z_m: float | None = None
     tip_span_m: float | None = None
     open_margin_m: float = 0.0
-    approach_dx_m: float = 0.16
-    approach_dy_m: float = 0.25
+    approach_dx_m: float = 0.10
+    approach_dy_m: float = 0.08
     calib_pending: bool = True
 
     def as_dict(self) -> dict:
@@ -92,12 +92,12 @@ class LargeBoardPlan:
             "left_squeeze": [round(float(v), 5) for v in self.left_squeeze],
             "right_squeeze": [round(float(v), 5) for v in self.right_squeeze],
             "tip_rule": (
-                "tip= mid(P2,P3) 后基座偏移：x+=dx(默认16cm)；"
-                "左 y+=dy(默认+25cm)、右 y-=dy(默认−25cm)；Z=grasp_z"
+                "左 tip=(P3.x+dx, P3.y+dy)；右 tip=(P2.x+dx, P2.y−dy)；"
+                "默认 dx=15cm、dy=8cm（外开）；接近 Z=grasp_z+hover"
             ),
             "depth_rule": (
                 "头定位：四角射线 ∩ 固定板面 Z=grasp_z_m；"
-                "精定位：左腕看 P3、右腕看 P2，按 board_id 匹配后用精 2/3"
+                "精定位：左腕看 P3、右腕看 P2，与头四角匹配后用精 2/3"
             ),
             "approach_rule": (
                 "接近=抓取 tip（固定 dx/±dy）；合拢靠双臂位移 + 遇阻停"
@@ -162,8 +162,8 @@ def tips_from_p2_p3(
     corners_base: Sequence[Sequence[float]],
     *,
     grasp_z_m: float | None = None,
-    approach_dx_m: float = 0.16,
-    approach_dy_m: float = 0.25,
+    approach_dx_m: float = 0.15,
+    approach_dy_m: float = 0.08,
     orient_rz_offset_deg: float = 0.0,
     # 兼容旧调用（忽略）
     half_width_m: float | None = None,
@@ -172,9 +172,8 @@ def tips_from_p2_p3(
 ) -> tuple[list[float], list[float], float, float, float, float, float, dict]:
     """由精/粗 P2、P3 算左右 tip。
 
-    mid = mid(P2,P3)；
-    tip_L = (mid_x+dx, mid_y+dy, z)；tip_R = (mid_x+dx, mid_y-dy, z)。
-    基座系：左臂偏 +Y、右臂偏 −Y。
+    左 tip = (P3.x+dx, P3.y+dy, z)；右 tip = (P2.x+dx, P2.y−dy, z)。
+    基座系：左臂偏 +Y（外）、右臂偏 −Y（外）。
     rz = ∥ P2→P3。
 
     Returns tip_l, tip_r, width, gripper_rz, edge_yaw, ux, uy, meta.
@@ -187,8 +186,8 @@ def tips_from_p2_p3(
     dx = float(approach_dx_m)
     dy = float(approach_dy_m)
     z = float(grasp_z_m) if grasp_z_m is not None else float(mid[2])
-    tip_l = [float(mid[0]) + dx, float(mid[1]) + dy, z]
-    tip_r = [float(mid[0]) + dx, float(mid[1]) - dy, z]
+    tip_l = [float(p3[0]) + dx, float(p3[1]) + dy, z]
+    tip_r = [float(p2[0]) + dx, float(p2[1]) - dy, z]
     width = float(math.hypot(tip_r[0] - tip_l[0], tip_r[1] - tip_l[1]))
     # 外开方向：左→右（约 −Y）
     ux, uy = _unit_xy(tip_r[0] - tip_l[0], tip_r[1] - tip_l[1])
@@ -199,7 +198,7 @@ def tips_from_p2_p3(
         p2, p3, orient_rz_offset_deg=orient_rz_offset_deg
     )
     meta = {
-        "mid_mode": "mid_p2p3_fixed_xy_offset",
+        "mid_mode": "corner_p2p3_xy_offset",
         "p0_xy": [float(p0[0]), float(p0[1])],
         "p1_xy": [float(p1[0]), float(p1[1])],
         "p2_xy": [float(p2[0]), float(p2[1])],
@@ -211,7 +210,7 @@ def tips_from_p2_p3(
             round(0.5 * (tip_l[0] + tip_r[0]), 5),
             round(0.5 * (tip_l[1] + tip_r[1]), 5),
         ],
-        "span_source": "fixed_dy_2x",
+        "span_source": "corner_xy_offset",
         "z_source": "calib_grasp_z_m" if grasp_z_m is not None else "vision_corner_z",
         "orient_source": "parallel_p2p3",
         "calib_pending": grasp_z_m is None,
@@ -267,10 +266,14 @@ def plan_large_board_grasp(
     tip_span_m: float | None = None,
     orient_edge: str = "parallel_p2p3",
     orient_rz_offset_deg: float = 0.0,
-    approach_dx_m: float = 0.16,
-    approach_dy_m: float = 0.25,
+    approach_dx_m: float = 0.15,
+    approach_dy_m: float = 0.08,
+    approach_z_m: float | None = None,
 ) -> LargeBoardPlan:
-    """精/粗 P2P3 → 双臂平行接近（固定 dx/±dy）。"""
+    """精/粗 P2P3 → 双臂接近（相对角点 dx / ±dy）。
+
+    ``approach_z_m``：接近停靠 tip Z（默认与抓取 tip 同高）；抓取 tip 仍用 ``grasp_z_m``。
+    """
     tip_l, tip_r, width, gripper_rz, edge_yaw, ux, uy, meta = tips_from_p2_p3(
         pose.corners_base,
         half_width_m=half_width_m,
@@ -288,12 +291,14 @@ def plan_large_board_grasp(
         meta["z_source"] = "hover_z_minus_tool_z"
         meta["calib_pending"] = True
 
-    # 新策略：接近位即 tip（dx/±dy 已含外开）；open_margin 默认 0
+    # 新策略：接近位即 tip XY（dx/±dy 已含外开）；Z 可抬高停靠
     open_m = max(0.0, float(open_margin_m))
     close_m = max(0.0, float(squeeze_close_m))
     z = tip_l[2]
-    tip_l_app = [float(tip_l[0]) - ux * open_m, float(tip_l[1]) - uy * open_m, z]
-    tip_r_app = [float(tip_r[0]) + ux * open_m, float(tip_r[1]) + uy * open_m, z]
+    z_app = float(approach_z_m) if approach_z_m is not None else z
+    meta["approach_z_m"] = float(z_app)
+    tip_l_app = [float(tip_l[0]) - ux * open_m, float(tip_l[1]) - uy * open_m, z_app]
+    tip_r_app = [float(tip_r[0]) + ux * open_m, float(tip_r[1]) + uy * open_m, z_app]
     half_close = 0.5 * close_m
     tip_l_sq = [tip_l[0] + ux * half_close, tip_l[1] + uy * half_close, z]
     tip_r_sq = [tip_r[0] - ux * half_close, tip_r[1] - uy * half_close, z]

@@ -83,6 +83,110 @@ _confirm_answer: bool | None = None
 _inward_ctx: dict | None = None
 _INWARD_STEP_M = 0.005
 _cam_lock = threading.Lock()
+# 本轮作业开始时的左右臂法兰位姿（复位用）
+_session_home_left: list[float] | None = None
+_session_home_right: list[float] | None = None
+
+
+def _record_session_home() -> dict:
+    """作业启动时记下当前左右法兰，供「复位」回到起点。"""
+    global _session_home_left, _session_home_right
+    left = right = None
+    with _lock:
+        motion, dual = _motion, _dual
+    if motion is not None:
+        try:
+            left = [float(x) for x in motion.get_flange_pose()[:6]]
+        except Exception as exc:
+            LOG.warning("record session home left failed: %s", exc)
+    if dual is not None:
+        try:
+            rm = getattr(dual, "right", None)
+            if rm is not None:
+                right = [float(x) for x in rm.get_flange_pose()[:6]]
+        except Exception as exc:
+            LOG.warning("record session home right failed: %s", exc)
+    with _lock:
+        _session_home_left = left
+        _session_home_right = right
+    LOG.info(
+        "session home recorded L=%s R=%s",
+        None if left is None else tuple(round(v, 4) for v in left[:3]),
+        None if right is None else tuple(round(v, 4) for v in right[:3]),
+    )
+    return {
+        "left": left,
+        "right": right,
+        "has_home": left is not None or right is not None,
+    }
+
+
+def _go_session_home() -> dict:
+    """双臂回到本轮作业起点；清 job 状态便于重新定位/抓取。"""
+    global _session_home_left, _session_home_right, _inward_ctx
+    global _preview_jpeg, _confirm_jpeg, _wrist_preview_jpeg
+    with _lock:
+        if _job.get("running"):
+            raise ValueError("任务进行中，请先等结束或急停")
+        left = list(_session_home_left) if _session_home_left else None
+        right = list(_session_home_right) if _session_home_right else None
+        dual, motion = _dual, _motion
+    if left is None and right is None:
+        raise ValueError("尚未记录作业起点（请先跑一次「全流程」）")
+    if motion is None and dual is None:
+        raise ValueError("请先「连接机械臂」")
+    scale = float(getattr(_cfg, "move_velocity_scale", 0.25))
+    moved = []
+    if dual is not None and left is not None and right is not None and hasattr(dual, "move_both"):
+        LOG.info("session home → move_both")
+        dual.move_both(left, right, velocity_scale=scale, parallel=True)
+        moved = ["left", "right"]
+    else:
+        if left is not None and motion is not None:
+            LOG.info("session home → left %s", [round(v, 4) for v in left[:3]])
+            try:
+                motion.move_line(left, velocity_scale=scale, keep_orientation=False, direct=False)
+            except TypeError:
+                motion.move_line(left, velocity_scale=scale)
+            moved.append("left")
+        if right is not None and dual is not None:
+            rm = getattr(dual, "right", None)
+            if rm is not None:
+                LOG.info("session home → right %s", [round(v, 4) for v in right[:3]])
+                try:
+                    rm.move_line(right, velocity_scale=scale, keep_orientation=False, direct=False)
+                except TypeError:
+                    rm.move_line(right, velocity_scale=scale)
+                moved.append("right")
+    with _lock:
+        _inward_ctx = None
+        _preview_jpeg = b""
+        _confirm_jpeg = b""
+        _wrist_preview_jpeg = b""
+        _job.update(
+            {
+                "running": False,
+                "ok": None,
+                "message": "已复位到作业起点，可刷新后重新定位/抓取",
+                "result": None,
+                "error": "",
+                "awaiting_confirm": False,
+                "confirm_message": "",
+                "confirm_plan": None,
+                "confirm_board_id": None,
+                "inward_steps": 0,
+                "has_wrist_vis": False,
+            }
+        )
+    return {
+        "ok": True,
+        "moved": moved,
+        "message": "已复位到作业起点，请刷新页面后重新「只定位/全流程」",
+        "home": {
+            "left": left,
+            "right": right,
+        },
+    }
 
 
 def _robot_snapshot() -> dict:
@@ -189,7 +293,7 @@ def _ensure_wrist_cam():
         LOG.info(
             "opening wrist source=%s portal_id=%s",
             src,
-            getattr(_cfg, "cam_portal_wrist_id", 13),
+            getattr(_cfg, "cam_portal_wrist_id", 1),
         )
         _wrist_cam = open_wrist_camera(_cfg)
     return _wrist_cam
@@ -324,7 +428,9 @@ def _grab_preview(*, detect: bool = True) -> tuple[bytes, dict]:
         vis = rect.copy()
         if detect:
             try:
-                pipe._ensure_detectors()  # noqa: SLF001
+                # 头预览只加载头模，避免小板腕模缺失拖垮预览
+                if pipe._head_det is None:  # noqa: SLF001
+                    pipe._ensure_detectors()  # noqa: SLF001
                 assert pipe._head_det is not None  # noqa: SLF001
                 dets = pipe._head_det.detect(rect)  # noqa: SLF001
                 n_det = len(dets)
@@ -493,6 +599,8 @@ def _result_payload(result, batch_dir: Path) -> dict:
     cli = dbg.get("cli") or {}
     left_app = dbg.get("left_approach")
     right_app = dbg.get("right_approach")
+    coarse_left = dbg.get("coarse_left")
+    coarse_right = dbg.get("coarse_right")
     left_grasp = dbg.get("left_grasp")
     right_grasp = dbg.get("right_grasp")
     return {
@@ -510,6 +618,10 @@ def _result_payload(result, batch_dir: Path) -> dict:
         "coarse_xyzrpy_mm_deg": _mm_deg(result.hover_flange),
         "fine_xyzrpy_mm_deg": _mm_deg(result.fine_flange),
         # 大板双臂末端（接近 / 合拢 tip）
+        "coarse_left": coarse_left,
+        "coarse_right": coarse_right,
+        "coarse_left_xyzrpy_mm_deg": _mm_deg(coarse_left),
+        "coarse_right_xyzrpy_mm_deg": _mm_deg(coarse_right),
         "left_approach": left_app,
         "right_approach": right_app,
         "left_grasp": left_grasp,
@@ -772,6 +884,8 @@ def _run_job(opts: dict) -> None:
                 motion, dual = _motion, _dual
             if motion is None:
                 raise RuntimeError("当前没有连接机械臂")
+            # 全流程一开始记下当前左右位姿，供网页「复位」
+            _record_session_home()
         elif plan_only and robot.get("connected") and _motion is not None:
             # 识别抓取点：不动臂，但用真实 TCP 做腕部精定位（腕可见时）
             with _lock:
@@ -844,52 +958,59 @@ def _run_job(opts: dict) -> None:
             try:
                 payload = _result_payload(partial, batch_dir)
                 payload["ok"] = None  # 进行中
+                def _xyz_mm(p):
+                    if not p or len(p) < 3:
+                        return None
+                    return f"({p[0]*1000:.1f},{p[1]*1000:.1f},{p[2]*1000:.1f})"
+
                 if phase == "coarse":
-                    hf = payload.get("hover_flange") or []
-                    if len(hf) >= 6:
+                    left = _xyz_mm(payload.get("coarse_left") or payload.get("hover_flange"))
+                    right = _xyz_mm(payload.get("coarse_right"))
+                    if left and right:
                         msg = (
                             f"粗定位完成 ID={payload.get('target_board_id')} "
-                            f"目标末端 xyz=({hf[0]:.3f},{hf[1]:.3f},{hf[2]:.3f}) "
-                            f"rpy_deg=({math.degrees(hf[3]):.1f},"
-                            f"{math.degrees(hf[4]):.1f},"
-                            f"{math.degrees(hf[5]):.1f}) → 开始接近…"
+                            f"左目标mm={left} 右目标mm={right}"
+                        )
+                    elif left:
+                        msg = (
+                            f"粗定位完成 ID={payload.get('target_board_id')} "
+                            f"目标末端mm={left}"
                         )
                     else:
-                        msg = (
-                            f"粗定位完成 ID={payload.get('target_board_id')} "
-                            f"→ 开始接近…"
-                        )
-                    if getattr(pipe, "_last_head_pose_vis", None) is not None:
-                        try:
-                            jpeg = _encode_jpeg(pipe._last_head_pose_vis)  # noqa: SLF001
-                            with _lock:
-                                _preview_jpeg = jpeg
-                        except Exception:
-                            pass
+                        msg = f"粗定位完成 ID={payload.get('target_board_id')}"
                 elif phase == "fine":
-                    d = payload.get("dxy_mm") or {}
-                    msg = (
-                        f"精定位完成 Δxy=({d.get('dx', '?')},{d.get('dy', '?')})mm "
-                        f"|Δ|={d.get('hypot', '?')}mm → 开始抓取移动…"
-                    )
-                    if getattr(pipe, "_last_wrist_pose_vis", None) is not None:
-                        try:
-                            wjpeg = _encode_jpeg(
-                                pipe._last_wrist_pose_vis  # noqa: SLF001
-                            )
-                            with _lock:
-                                _wrist_preview_jpeg = wjpeg
-                        except Exception:
-                            pass
-                    if getattr(pipe, "_last_head_pose_vis", None) is not None:
-                        try:
-                            jpeg = _encode_jpeg(pipe._last_head_pose_vis)  # noqa: SLF001
-                            with _lock:
-                                _preview_jpeg = jpeg
-                        except Exception:
-                            pass
+                    la = _xyz_mm(payload.get("left_approach"))
+                    ra = _xyz_mm(payload.get("right_approach"))
+                    lg = _xyz_mm(payload.get("left_grasp"))
+                    rg = _xyz_mm(payload.get("right_grasp"))
+                    if la and ra:
+                        msg = (
+                            f"精定位完成 接近 左{la} 右{ra}"
+                            + (f" 夹取 左{lg} 右{rg}" if lg and rg else "")
+                        )
+                    else:
+                        d = payload.get("dxy_mm") or {}
+                        msg = (
+                            f"精定位完成 Δxy=({d.get('dx', '?')},{d.get('dy', '?')})mm "
+                            f"|Δ|={d.get('hypot', '?')}mm"
+                        )
                 else:
                     msg = f"进度: {phase}"
+                # 头/腕识别图：粗（含大板单臂腕粗）与精都推；有图就写
+                if getattr(pipe, "_last_head_pose_vis", None) is not None:
+                    try:
+                        jpeg = _encode_jpeg(pipe._last_head_pose_vis)  # noqa: SLF001
+                        with _lock:
+                            _preview_jpeg = jpeg
+                    except Exception:
+                        pass
+                if getattr(pipe, "_last_wrist_pose_vis", None) is not None:
+                    try:
+                        wjpeg = _encode_jpeg(pipe._last_wrist_pose_vis)  # noqa: SLF001
+                        with _lock:
+                            _wrist_preview_jpeg = wjpeg
+                    except Exception:
+                        pass
                 payload["message"] = msg
                 with _lock:
                     _job.update(
@@ -1080,8 +1201,34 @@ class Handler(BaseHTTPRequestHandler):
             if jpeg:
                 self._send_jpeg(jpeg)
                 return
-            self._send(404, {"ok": False, "error": "暂无腕部精定位图"})
-            return
+            # 尚无精定位结果图时：尝试拉左腕实时画面
+            try:
+                import cv2
+
+                with _cam_lock:
+                    bgr, _dep = _grab_wrist()
+                vis = bgr.copy()
+                cv2.putText(
+                    vis,
+                    "WRIST live (await fine result)",
+                    (8, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                )
+                self._send_jpeg(_encode_jpeg(vis))
+                return
+            except Exception as exc:
+                LOG.warning("wrist live preview failed: %s", exc)
+                self._send(
+                    404,
+                    {
+                        "ok": False,
+                        "error": f"暂无腕部图（精定位后才有结果；实时预览失败: {exc}）",
+                    },
+                )
+                return
         if path == "/api/head.jpg":
             job = _job_snapshot()
             if job.get("running") and not job.get("awaiting_confirm"):
@@ -1229,6 +1376,25 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "识别抓取点…" if plan_only else "已启动抓取",
                     },
                 )
+                return
+            if self.path == "/api/session_home":
+                action = str(data.get("action") or "go").strip().lower()
+                if action in ("record", "capture", "save"):
+                    info = _record_session_home()
+                    if not info.get("has_home"):
+                        raise ValueError("记录失败：读不到法兰位姿")
+                    self._send(
+                        200,
+                        {
+                            "ok": True,
+                            "action": "record",
+                            "home": info,
+                            "message": "已记录当前为作业起点",
+                        },
+                    )
+                    return
+                out = _go_session_home()
+                self._send(200, out)
                 return
             if self.path == "/api/estop":
                 with _lock:

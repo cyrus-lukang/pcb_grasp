@@ -304,6 +304,8 @@ def save_experiment_artifacts(
     head_depth_u16_mm: np.ndarray | None = None,
     head_depth_stats: dict[str, Any] | None = None,
     wrist_pose_vis: np.ndarray | None = None,
+    wrist_pose_left_vis: np.ndarray | None = None,
+    wrist_pose_right_vis: np.ndarray | None = None,
     wrist_match_vis: np.ndarray | None = None,
     wrist_color: np.ndarray | None = None,
     wrist_depth: np.ndarray | None = None,
@@ -359,6 +361,8 @@ def save_experiment_artifacts(
         written.append("head/depth_stats.json")
 
     _im(wrist_dir / "pose.jpg", wrist_pose_vis)
+    _im(wrist_dir / "pose_left.jpg", wrist_pose_left_vis)
+    _im(wrist_dir / "pose_right.jpg", wrist_pose_right_vis)
     _im(wrist_dir / "match.jpg", wrist_match_vis)
     _im(wrist_dir / "color.jpg", wrist_color)
     if wrist_depth is not None:

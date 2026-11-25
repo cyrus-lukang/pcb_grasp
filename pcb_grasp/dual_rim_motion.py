@@ -80,8 +80,11 @@ class DualRimMotion:
             float(right6[2]),
         )
         try:
+            # 左臂结束后立刻发右臂：跳过右臂 move 前的 CLI 读 TCP
             pose_l = self.left.move_line(left6, velocity_scale=velocity_scale)
-            pose_r = self.right.move_line(right6, velocity_scale=velocity_scale)
+            pose_r = self.right.move_line(
+                right6, velocity_scale=velocity_scale, refresh_start=False
+            )
             return DualMoveResult(left=pose_l, right=pose_r, ok=True, message="ok")
         except Exception as exc:  # noqa: BLE001
             return DualMoveResult(

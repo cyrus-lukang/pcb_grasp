@@ -1,0 +1,29 @@
+# 头部离线定位：手眼 + YOLO-Pose → 基座 XYZ / rz
+# 手眼相机 = portal cam7 = 落盘 raw_left.jpg（handeye 名 head_fisheye_right）
+# raw_right.jpg = portal cam6，仅作双目右图算 FFS 深度
+
+handeye_yaml: /home/ubuntu/workspace/lk_Perception/calibration/calibration_runtime/data/results/20261123_154818_head_chest_leftwrist/head_fisheye_right_s36_handeye_from_stereo.yaml
+
+pose_weights: /home/ubuntu/workspace/pcb_grasp/models/yolopose/yolopose_3cls_20261105163435_041ee5/best.pt
+
+stereo_calib_json: /home/ubuntu/workspace/pcb_grasp/calib/stereo/stereo_calib_cam6.json
+
+ffs_weights: /home/ubuntu/workspace/pcb_grasp/models/ffs/model_best_bp2_serialize.pth
+ffs_cfg: /home/ubuntu/workspace/pcb_grasp/models/ffs/cfg.yaml
+
+detect:
+  conf: 0.4
+  kpt_conf: 0.35
+  imgsz: 480
+  device: 0
+
+classes:
+  pcb_small: 0
+  nopcb: 1
+  pcb_large: 2
+
+# 大板用 FFS 角点深度；小板可用托盘平面
+head_tray_z_m: 0.71548
+large_use_fixed_grasp_z_plane: false
+kp_i: 0
+kp_j: 1

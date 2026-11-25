@@ -37,3 +37,6 @@ calib/stereo/stereo_maps*.yaml
 # 本地日志
 *.log
 /tmp/
+
+# 子项目落盘
+projects/**/output/

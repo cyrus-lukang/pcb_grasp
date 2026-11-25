@@ -38,7 +38,8 @@ _SDK_PY = Path("/home/ubuntu/workspace/perception/.venv-sdk/bin/python")
 DEFAULT_FRAME_BUNDLE = "10.3.8.7:50066"
 
 # 到位软判据：子进程失败但 TCP+姿态都够近才当成功（纯转姿态时位置Δ≈0，不能只看位移）
-_ARRIVE_OK_MM = 25.0
+_ARRIVE_OK_MM = 20.0
+_ARRIVE_OK_Z_MM = 12.0  # tipZ（如 grasp_z=681）单独收紧，防 XY 近但高度差 3~4cm
 _ARRIVE_OK_DEG = 8.0
 # MC PLAN_TO_POSE 对约 ≤5cm 的位移常直接 SUCCEEDED 且 TCP 不动（现场 40~45mm 必现）
 _MC_DEADZONE_MM = 70.0
@@ -66,7 +67,12 @@ def _pose_close_enough(cur: Sequence[float], tgt: Sequence[float]) -> bool:
         np.linalg.norm(np.asarray(cur[:3], dtype=float) - np.asarray(tgt[:3], dtype=float))
         * 1000.0
     )
-    return remain_mm <= _ARRIVE_OK_MM and _ori_err_deg(cur, tgt) <= _ARRIVE_OK_DEG
+    dz_mm = abs(float(cur[2]) - float(tgt[2])) * 1000.0
+    return (
+        remain_mm <= _ARRIVE_OK_MM
+        and dz_mm <= _ARRIVE_OK_Z_MM
+        and _ori_err_deg(cur, tgt) <= _ARRIVE_OK_DEG
+    )
 
 
 def _arm_side(arm: str) -> str:
@@ -527,21 +533,20 @@ class RimMotion(MotionBackend):
         del start, velocity_scale
         return self._cli_move_to_pose(tgt, tag=tag)
 
-    def _cli_move_to_pose(
+    def _cli_move_to_pose_once(
         self,
         tgt: Sequence[float],
         *,
         tag: str = "",
         max_linear_vel: float | None = None,
         timeout_s: float | None = None,
-    ) -> list[float]:
-        """把目标位姿交给 ``python -m rim_python.move_to_pose --pose … --execute``。"""
+    ) -> tuple[list[float] | None, int, str]:
+        """单次 CLI 下发；返回 (final_pose|None, returncode, tail_msg)。"""
         goal = [float(x) for x in tgt[:6]]
         pose_str = _pose_mm_deg_str(goal)
         wait_s = float(
             self.plan_timeout_s if timeout_s is None else timeout_s
         )
-        # 与手动命令一致；--allow-large 避免大位移被 CLI 默认上限拦下
         extra = [
             "--pose",
             pose_str,
@@ -576,30 +581,137 @@ class RimMotion(MotionBackend):
                 after = self._read_tcp_m_rad()
             except Exception:
                 after = None
+        tail = (out.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+        return after, int(proc.returncode), str(tail)
 
-        if proc.returncode != 0:
-            tail = (out.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
-            detail = ""
+    def _cli_move_to_pose(
+        self,
+        tgt: Sequence[float],
+        *,
+        tag: str = "",
+        max_linear_vel: float | None = None,
+        timeout_s: float | None = None,
+    ) -> list[float]:
+        """下发目标并校验 TCP 真到位；MC 假成功 / 死区停半路会自动 via+重试。"""
+        goal = [float(x) for x in tgt[:6]]
+        last: list[float] | None = list(self._pose) if self._pose else None
+        last_tail = ""
+
+        for attempt in range(1, int(_EXECUTE_RETRIES) + 1):
+            # 剩余落在 MC 死区：先经 via 拉出，否则再 PLAN 目标会假 SUCCEEDED
+            if last is not None:
+                remain0 = float(
+                    np.linalg.norm(
+                        np.asarray(last[:3], dtype=float)
+                        - np.asarray(goal[:3], dtype=float)
+                    )
+                    * 1000.0
+                )
+                if _pose_close_enough(last, goal):
+                    self._pose = list(last)
+                    return list(self._pose)
+                if 1.0 < remain0 <= float(_MC_DEADZONE_MM):
+                    via = self._mc_deadzone_via(last, goal)
+                    if via is not None:
+                        LOG.warning(
+                            "RIM %s attempt %d/%d remain=%.0fmm ∈死区→ via "
+                            "(%.0f,%.0f,%.0f)mm 再投 goal",
+                            self.side,
+                            attempt,
+                            _EXECUTE_RETRIES,
+                            remain0,
+                            via[0] * 1000.0,
+                            via[1] * 1000.0,
+                            via[2] * 1000.0,
+                        )
+                        via_pose, _, _ = self._cli_move_to_pose_once(
+                            via,
+                            tag=f"{tag}|via{attempt}" if tag else f"via{attempt}",
+                            max_linear_vel=max_linear_vel,
+                            timeout_s=timeout_s,
+                        )
+                        if via_pose is not None:
+                            last = via_pose
+                            self._pose = list(via_pose)
+
+            after, rc, tail = self._cli_move_to_pose_once(
+                goal,
+                tag=f"{tag}|try{attempt}" if tag else f"try{attempt}",
+                max_linear_vel=max_linear_vel,
+                timeout_s=timeout_s,
+            )
+            last_tail = tail
             if after is not None:
+                last = after
+                self._pose = list(after)
                 remain = float(
-                    np.linalg.norm(np.asarray(after[:3]) - np.asarray(goal[:3])) * 1000.0
+                    np.linalg.norm(
+                        np.asarray(after[:3], dtype=float)
+                        - np.asarray(goal[:3], dtype=float)
+                    )
+                    * 1000.0
                 )
                 ori_err = _ori_err_deg(after, goal)
+                dz_mm = abs(float(after[2]) - float(goal[2])) * 1000.0
                 if _pose_close_enough(after, goal):
-                    LOG.warning(
-                        "move_to_pose exit≠0 但 TCP 已近 remain=%.1fmm ori=%.1f°，按到位",
-                        remain,
-                        ori_err,
-                    )
-                    self._pose = after
+                    if rc != 0:
+                        LOG.warning(
+                            "move_to_pose exit≠0 但 TCP 已近 remain=%.1fmm "
+                            "ori=%.1f° ΔZ=%.1fmm，按到位",
+                            remain,
+                            ori_err,
+                            dz_mm,
+                        )
+                    elif attempt > 1:
+                        LOG.info(
+                            "RIM %s arrived after retry %d remain=%.1fmm ΔZ=%.1fmm",
+                            self.side,
+                            attempt,
+                            remain,
+                            dz_mm,
+                        )
                     return list(self._pose)
-                detail = f" (TCP remain={remain:.0f}mm ori={ori_err:.1f}°)"
-            raise RuntimeError(f"rim_python.move_to_pose 失败: {tail}{detail}")
+                LOG.warning(
+                    "RIM %s attempt %d/%d MC=%s 但未到位 "
+                    "remain=%.0fmm ΔZ=%.0fmm ori=%.1f° → 续跑",
+                    self.side,
+                    attempt,
+                    _EXECUTE_RETRIES,
+                    "ok" if rc == 0 else tail,
+                    remain,
+                    dz_mm,
+                    ori_err,
+                )
+            else:
+                LOG.warning(
+                    "RIM %s attempt %d/%d 无 final TCP (%s) → 续跑",
+                    self.side,
+                    attempt,
+                    _EXECUTE_RETRIES,
+                    tail,
+                )
+            if attempt < int(_EXECUTE_RETRIES):
+                time.sleep(float(_RETRY_SLEEP_S))
 
-        if after is None:
-            after = self._read_tcp_m_rad()
-        self._pose = after
-        return list(self._pose)
+        detail = ""
+        if last is not None:
+            remain = float(
+                np.linalg.norm(
+                    np.asarray(last[:3], dtype=float)
+                    - np.asarray(goal[:3], dtype=float)
+                )
+                * 1000.0
+            )
+            dz_mm = abs(float(last[2]) - float(goal[2])) * 1000.0
+            detail = (
+                f" (TCP remain={remain:.0f}mm ΔZ={dz_mm:.0f}mm "
+                f"ori={_ori_err_deg(last, goal):.1f}°)"
+            )
+            self._pose = list(last)
+        raise RuntimeError(
+            f"rim_python.move_to_pose 未到位 after {_EXECUTE_RETRIES} tries: "
+            f"{last_tail}{detail}"
+        )
 
     def move_jog(
         self,
@@ -637,11 +749,20 @@ class RimMotion(MotionBackend):
         keep_orientation: bool = False,
         allow_partial: bool = False,
         direct: bool = False,
+        refresh_start: bool = False,
     ) -> list[float]:
-        """``move_to_pose --execute`` 单段直达（与 CLI 相同）。"""
+        """``move_to_pose --execute`` 单段直达（与 CLI 相同）。
+
+        默认用缓存 TCP 打 from= 日志，不再每次先起 CLI 读位姿——
+        否则双臂串行 L→R 时，左臂刚结束还会空等 ~1s 才发右臂规划。
+        CLI 自己会读当前位姿；仅 ``keep_orientation`` / ``refresh_start`` 才强制刷新。
+        """
         del allow_partial
         tgt = [float(x) for x in xyzrpy[:6]]
-        cur = self.get_flange_pose()
+        if keep_orientation or refresh_start or not self._pose:
+            cur = self.get_flange_pose()
+        else:
+            cur = list(self._pose)
         if keep_orientation:
             tgt = [tgt[0], tgt[1], tgt[2], cur[3], cur[4], cur[5]]
         self.history.append(list(tgt))

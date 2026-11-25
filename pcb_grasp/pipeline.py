@@ -33,7 +33,7 @@ from .geometry import (
     compute_flange_target,
     nearest_rz_rad,
 )
-from .localize import Intrinsics, format_pose, head_localize, wrist_localize
+from .localize import Intrinsics, format_pose, head_localize, sample_depth_m, wrist_localize
 from .motion import DryRunMotion, MotionBackend
 from .robust import (
     median_detection,
@@ -42,9 +42,33 @@ from .robust import (
     pick_closest_to_mean_xyz,
     pose_keep_mask,
 )
-from .undistort import HeadRectifyMaps, build_maps_from_stereo_json, load_maps_from_yml
+from .undistort import (
+    HeadRectifyMaps,
+    T_base_from_rectified,
+    build_maps_from_stereo_json,
+    load_maps_from_yml,
+)
 
 LOG = logging.getLogger("pcb_grasp.pipeline")
+
+
+def _announce_targets(title: str, named: Sequence[tuple[str, Sequence[float]]]) -> None:
+    """把阶段目标打到日志和终端。位姿为米/弧度，打印成毫米/度。"""
+    lines = [title]
+    for name, pose in named:
+        p = [float(x) for x in pose]
+        if len(p) >= 6:
+            lines.append(
+                f"  {name}  xyz_mm=({p[0] * 1000:.1f}, {p[1] * 1000:.1f}, {p[2] * 1000:.1f})"
+                f"  rpy_deg=({math.degrees(p[3]):.1f}, {math.degrees(p[4]):.1f}, {math.degrees(p[5]):.1f})"
+            )
+        else:
+            lines.append(
+                f"  {name}  xyz_mm=({p[0] * 1000:.1f}, {p[1] * 1000:.1f}, {p[2] * 1000:.1f})"
+            )
+    text = "\n".join(lines)
+    LOG.info("\n%s", text)
+    print(text, flush=True)
 
 
 def _pose_dist(a: ObjectPose, b: ObjectPose) -> float:
@@ -155,6 +179,8 @@ class GraspPipeline:
         )
         self._head_maps: HeadRectifyMaps | None = None
         self._head_K: Intrinsics | None = None
+        # 校正左目 → 基座。手眼是 6 号原相机，这里已乘上 R1.T。
+        self._T_base_head: np.ndarray | None = None
         self._head_det: YoloPoseDetector | None = None
         self._wrist_det: YoloPoseDetector | None = None
         self._large_wrist_det: YoloPoseDetector | None = None
@@ -165,6 +191,8 @@ class GraspPipeline:
         self._shape_model = None
         self._last_head_pose_vis: np.ndarray | None = None
         self._last_wrist_pose_vis: np.ndarray | None = None
+        self._last_wrist_fine_left_vis: np.ndarray | None = None
+        self._last_wrist_fine_right_vis: np.ndarray | None = None
         self._last_wrist_match_vis: np.ndarray | None = None
         self._last_head_rect: np.ndarray | None = None
         self._last_head_raw_l: np.ndarray | None = None
@@ -232,7 +260,19 @@ class GraspPipeline:
             self._head_maps = load_maps_from_yml(self.cfg.stereo_maps_yml)
         else:
             raise RuntimeError("Need calib.stereo_calib_json or stereo_maps_yml for head undistort")
+        # 检测图画在 7 号的 CAM0 校正图上，内参是 K_rect。
+        # 手眼是 7 号物理相机：p_cam7 = R1.T @ p_rect。
         self._head_K = Intrinsics.from_K(self._head_maps.K_rect)
+        self._T_base_head = T_base_from_rectified(
+            self.cfg.T_base_cam, self._head_maps.R1
+        )
+        LOG.info(
+            "head stereo left=cam7 CAM0  K_rect fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+            self._head_K.fx,
+            self._head_K.fy,
+            self._head_K.cx,
+            self._head_K.cy,
+        )
         return self._head_maps
 
     def _ensure_detectors(self) -> None:
@@ -250,6 +290,12 @@ class GraspPipeline:
         if self._wrist_det is None:
             # 小板腕精：models.wrist_pose_weights（与大板角点模分开）
             w = self.cfg.wrist_pose_weights or self.cfg.head_pose_weights
+            if not w or not Path(w).is_file():
+                LOG.warning(
+                    "SMALL wrist weights missing (%s) → 跳过加载小板腕模",
+                    w,
+                )
+                return
             self._wrist_det = YoloPoseDetector(
                 w,
                 conf=self.cfg.wrist_conf,
@@ -260,19 +306,30 @@ class GraspPipeline:
             LOG.info("SMALL wrist fine detector ← %s", w)
 
     def _ensure_large_wrist_det(self) -> YoloPoseDetector | None:
-        """大板腕部角点精定位专用 YOLO（corner）；未配则返回 None。"""
+        """大板腕部角点精定位专用 YOLO（corner · 单角）；未配则返回 None。"""
         path = str(getattr(self.cfg, "large_wrist_pose_weights", "") or "").strip()
         if not path:
             return None
         if self._large_wrist_det is None:
+            imgsz = int(
+                getattr(self.cfg, "large_wrist_imgsz", 0)
+                or getattr(self.cfg, "wrist_imgsz", self.cfg.imgsz)
+            )
+            n_corners = int(getattr(self.cfg, "large_wrist_n_corners", 1) or 1)
             self._large_wrist_det = YoloPoseDetector(
                 path,
                 conf=self.cfg.wrist_conf,
                 kpt_conf=self.cfg.kpt_conf,
                 device=self.cfg.device,
-                imgsz=int(getattr(self.cfg, "wrist_imgsz", self.cfg.imgsz)),
+                imgsz=imgsz,
+                n_corners=n_corners,
             )
-            LOG.info("LARGE wrist corner detector ← %s", path)
+            LOG.info(
+                "LARGE wrist corner detector ← %s (imgsz=%d n_corners=%d)",
+                path,
+                imgsz,
+                n_corners,
+            )
         return self._large_wrist_det
 
     # --------------------------------------------------------------- perception
@@ -281,15 +338,15 @@ class GraspPipeline:
         return maps.undistort_left(fisheye_bgr)
 
     def _plane_z_for_cls(self, cls_id: int | None) -> float:
-        """头定位板面 Z：大板用标定 tip/板面高；其它用托盘高。"""
+        """头定位板面 Z：大板默认走 FFS（不锁平面）；仅显式固定平面时才用 grasp_z/托盘。"""
         large_cls = int(self.cfg.cls_pcb_large)
-        use_fixed = bool(getattr(self.cfg, "large_use_fixed_grasp_z_plane", True))
+        use_fixed = bool(getattr(self.cfg, "large_use_fixed_grasp_z_plane", False))
         if use_fixed and cls_id is not None and int(cls_id) == large_cls:
             gz = getattr(self.cfg, "large_grasp_z_m", None)
             if gz is not None:
                 return float(gz)
             LOG.warning(
-                "large grasp_z_m 未标定 → 头定位暂用 head_tray_z_m=%.4f（下午标定后写入 large_board.grasp_z_m）",
+                "large grasp_z_m 未设 → 固定平面暂用 head_tray_z_m=%.4f",
                 float(self.cfg.head_tray_z_m),
             )
         return float(self.cfg.head_tray_z_m)
@@ -300,24 +357,26 @@ class GraspPipeline:
         *,
         depth: np.ndarray | None = None,
         tray_z_m: float | None = None,
+        depth_m_per_corner: Sequence[float] | None = None,
     ) -> ObjectPose:
-        """单板头定位。大板默认只走固定板面求交，不采角点深度。"""
+        """单板头定位。角点深度用校正左目（cam7）上的 FFS。"""
         assert self._head_K is not None
+        T_head = self._T_base_head if self._T_base_head is not None else self.cfg.T_base_cam
         cls_id = int(getattr(det, "cls_id", 0) or 0)
         large_cls = int(self.cfg.cls_pcb_large)
+        is_large = cls_id == large_cls
         use_fixed_large = bool(
-            getattr(self.cfg, "large_use_fixed_grasp_z_plane", True)
-        ) and cls_id == large_cls
-        z_plane = (
-            float(tray_z_m)
-            if tray_z_m is not None
-            else self._plane_z_for_cls(cls_id)
-        )
-        if use_fixed_large:
-            # 大板：固定板面高度（标定 tip Z），不用 FFS/深度图角点
+            getattr(self.cfg, "large_use_fixed_grasp_z_plane", False)
+        ) and is_large
+        if tray_z_m is not None or use_fixed_large:
+            z_plane = (
+                float(tray_z_m)
+                if tray_z_m is not None
+                else self._plane_z_for_cls(cls_id)
+            )
             pose = head_localize(
                 det,
-                T_base_cam=self.cfg.T_base_cam,
+                T_base_cam=T_head,
                 K=self._head_K,
                 depth=None,
                 depth_scale=0.001,
@@ -327,16 +386,28 @@ class GraspPipeline:
                 kp_j=self.cfg.kp_j,
             )
         else:
+            # 大板：只用 FFS 角点深度反投影 XY/Z，禁止固定深度/托盘平面
+            if is_large and depth is None and depth_m_per_corner is None:
+                raise RuntimeError(
+                    "大板头定位需要 FFS 角点深度，禁止固定深度/托盘平面"
+                )
             pose = head_localize(
                 det,
-                T_base_cam=self.cfg.T_base_cam,
+                T_base_cam=T_head,
                 K=self._head_K,
                 depth=depth,
                 depth_scale=0.001,
-                fixed_depth_cam_m=self.cfg.head_fixed_depth_cam_m,
-                tray_z_m=z_plane,
+                fixed_depth_cam_m=(
+                    None
+                    if (is_large or depth is not None or depth_m_per_corner is not None)
+                    else self.cfg.head_fixed_depth_cam_m
+                ),
+                tray_z_m=None if is_large else self._plane_z_for_cls(cls_id),
                 kp_i=self.cfg.kp_i,
                 kp_j=self.cfg.kp_j,
+                depth_m_per_corner=depth_m_per_corner,
+                corner_z_max=1.0,
+                required_corner_indices=(2, 3) if is_large else None,
             )
         pose.cls_id = cls_id
         return pose
@@ -360,13 +431,13 @@ class GraspPipeline:
         if depth is None and right_fisheye_bgr is not None:
             est = self._ensure_stereo_depth()
             if already_undistorted:
-                # both left/right assumed already rectified
                 rect = fisheye_bgr
+                right_rect = right_fisheye_bgr
                 depth, _valid, depth_stats = est.estimate_rectified(
                     rect, right_fisheye_bgr
                 )
             else:
-                rect, _rr, depth, _valid, depth_stats = est.estimate_raw(
+                rect, _right_rect, depth, _valid, depth_stats = est.estimate_raw(
                     fisheye_bgr, right_fisheye_bgr
                 )
             if require_depth_ok and depth_stats is not None and not depth_stats.ok():
@@ -447,27 +518,28 @@ class GraspPipeline:
         grasp_z_m: float,
         plan_only: bool = False,
         grab_wrist_right=None,
+        save_vis_dir: str | Path | None = None,
     ) -> ObjectPose:
-        """大板精定位（P2/P3）：左看 3 → 回粗；右看 2 → 回粗；合成精 2/3。
+        """大板精定位（P2/P3）：粗到位拍腕 → 精 XY → 接近加 dx/dy。
 
-        - 左臂相机到粗 P3 上方 ``fine_hover_height``（默认 10cm）→ 腕 YOLO
-          → board_id 匹配 → 取精 P3 → 回粗定位法兰
-        - 右臂相机到粗 P2 上方同高 → 同上取精 P2 → 回粗
-        - 平面：角点射线 ∩ Z=grasp_z；rz 最终由 large_board 按 ∥P2→P3 计算
-        - 失败：warning，返回原 coarse
+        - 粗定位到达：末端在角点 XY、Z=grasp_z+fine_hover（左右统一），姿态垂直向下
+        - 腕精：深度=当前相机光心到写死 grasp_z 的光轴距离，反投影得精 XY
+        - 夹取：tip = 精角点 XY + (dx, ±dy)，tipZ = grasp_z（写死）
+        - ``plan_only``：不动臂；当前腕图能认出角点则精修并产出 tip，认不出才跳过
         """
         from .geometry import ObjectPose as _OP, pose_xyz_rpy_to_mat4
-        from .large_board import gripper_rz_large_parallel_p2p3
-        from .localize import corners_to_object_pose
+        from .large_board import gripper_rz_large_parallel_p2p3, tip_to_flange
+        from .localize import cam_depth_to_plane_m, corner_uv_to_base
 
+        self._large_wrist_fine_ok = False
         if not bool(getattr(self.cfg, "large_fine_enable", True)):
-            LOG.info("LARGE fine disabled → keep coarse P2/P3")
+            LOG.info("LARGE fine disabled → keep coarse P2/P3（不产出 tip）")
             return coarse
         det_model = self._ensure_large_wrist_det()
         if det_model is None:
             LOG.warning(
                 "LARGE fine: large_board.wrist_pose_weights 未配置 → 跳过精定位，"
-                "仍用头粗 P2/P3"
+                "不产出 tip"
             )
             return coarse
         if coarse.corners_base is None or len(coarse.corners_base) < 4:
@@ -475,37 +547,60 @@ class GraspPipeline:
             return coarse
 
         hover_h = float(
-            getattr(self.cfg, "large_fine_hover_height_m", 0.10) or 0.10
+            getattr(self.cfg, "large_fine_hover_height_m", 0.35) or 0.35
         )
-        z_cam = float(grasp_z_m) + hover_h
         max_d = float(getattr(self.cfg, "large_fine_match_max_dist_m", 0.15))
+        dx = float(getattr(self.cfg, "large_approach_dx_m", 0.15) or 0.15)
+        dy = float(getattr(self.cfg, "large_approach_dy_m", 0.08) or 0.08)
+        tool_y = float(getattr(self.cfg, "large_tool_y_m", 0.0) or 0.0)
+        tool_z = float(getattr(self.cfg, "large_tool_z_m", 0.0) or 0.0)
         coarse_boards = list(getattr(self, "_last_coarse_boards", []) or [coarse])
         tid = coarse.board_id
         p2_c = coarse.corners_base[2]
         p3_c = coarse.corners_base[3]
-        LOG.info(
-            "LARGE fine P2/P3: hover_h=%.3f camZ=%.3f board_id=%s "
-            "P2=(%.4f,%.4f) P3=(%.4f,%.4f)",
-            hover_h,
-            z_cam,
-            tid,
-            float(p2_c[0]),
-            float(p2_c[1]),
-            float(p3_c[0]),
-            float(p3_c[1]),
+        grasp_z_fixed = getattr(self.cfg, "large_grasp_z_m", None)
+        if grasp_z_fixed is None:
+            raise RuntimeError("large_board.grasp_z_m 未写死")
+        z_board = float(grasp_z_fixed)
+        # 拍腕高度统一：grasp_z + hover（不再跟 FFS 角点 Z，避免左右差十几毫米）
+        z_arrive = z_board + hover_h
+        z_p3_arrive = z_arrive
+        z_p2_arrive = z_arrive
+        hover_p3 = [float(p3_c[0]), float(p3_c[1])]
+        hover_p2 = [float(p2_c[0]), float(p2_c[1])]
+        grip_rz = gripper_rz_large_parallel_p2p3(
+            p2_c,
+            p3_c,
+            orient_rz_offset_deg=float(
+                getattr(self.cfg, "large_orient_rz_offset_deg", 0.0) or 0.0
+            ),
         )
-
-        if plan_only:
-            LOG.info("LARGE fine: plan_only → 不移动，跳过腕精")
-            return coarse
-
-        # 记录粗定位后的左右法兰，精定位后各自回原位
-        try:
-            coarse_fl_l, coarse_fl_r = self._read_both_tcp()
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("LARGE fine: read both TCP failed: %s", exc)
-            coarse_fl_l = list(self.motion.get_flange_pose()[:6])
-            coarse_fl_r = None
+        # tip_to_flange 外开方向（tool_y=0 时不影响 xyz）
+        _ux = float(hover_p2[0] - hover_p3[0])
+        _uy = float(hover_p2[1] - hover_p3[1])
+        _n = math.hypot(_ux, _uy) or 1.0
+        grasp_ux, grasp_uy = _ux / _n, _uy / _n
+        self._last_wrist_fine_left_vis = None
+        self._last_wrist_fine_right_vis = None
+        LOG.info(
+            "LARGE: 粗到位 XY=FFS角点 Z=grasp_z+%.3f=%.4f（统一）→ "
+            "P3=(%.4f,%.4f,%.4f) P2=(%.4f,%.4f,%.4f)；"
+            "腕精深度=相机到写死Z %.3f；夹取 tipZ=%.4f "
+            "后加 dx=%.3f dy=%.3f board_id=%s",
+            hover_h,
+            z_arrive,
+            hover_p3[0],
+            hover_p3[1],
+            z_p3_arrive,
+            hover_p2[0],
+            hover_p2[1],
+            z_p2_arrive,
+            z_board,
+            z_board,
+            dx,
+            dy,
+            tid,
+        )
 
         T_left = np.asarray(self.cfg.T_tool_cam, dtype=np.float64)
         T_right = getattr(self.cfg, "T_tool_cam_right", None)
@@ -520,8 +615,11 @@ class GraspPipeline:
         dual = self._ensure_dual()
         right_motion = getattr(dual, "right", None)
         left_motion = getattr(dual, "left", None) or self.motion
+        # 拍完不回退；后续 run_live 去 tip（角点 x+dx / y±dy）
+        coarse_fl_l = None
+        coarse_fl_r = None
 
-        # 右腕取流：优先回调，否则临时开 cam15
+        # 右腕取流：优先回调，否则临时开 cam3
         right_cam = None
         grab_r = grab_wrist_right
 
@@ -536,9 +634,10 @@ class GraspPipeline:
                 or getattr(self.cfg, "cam_portal", "10.3.8.7:50066")
             )
             dist = getattr(self.cfg, "wrist_dist_coeffs", None)
+            right_id = int(getattr(self.cfg, "cam_portal_wrist_right_id", 3))
             right_cam = WristPortalCam(
                 portal,
-                cam_id=15,
+                cam_id=right_id,
                 max_hz=float(getattr(self.cfg, "cam_portal_max_hz", 8.0)),
                 timeout_s=float(getattr(self.cfg, "cam_portal_timeout_s", 60.0)),
                 need_depth=False,
@@ -548,52 +647,282 @@ class GraspPipeline:
                 cy=float(getattr(self.cfg, "wrist_cy", 401.0)),
                 dist_coeffs=list(dist) if dist else None,
                 undistort=bool(getattr(self.cfg, "cam_wrist_undistort", True)),
-                depth_cam_id=14,
+                depth_cam_id=int(getattr(self.cfg, "cam_portal_wrist_right_depth_id", 2)),
             )
             grab_r = right_cam.grab
-            LOG.info("LARGE fine: opened right wrist cam15 @ %s", portal)
+            LOG.info("LARGE fine: opened right wrist cam%d @ %s", right_id, portal)
             return grab_r
+
+        # —— 只定位：不动臂，但若当前腕图能认出角点则精修并产出 tip ——
+        if plan_only:
+            from .detect import draw_pose_vis
+            from .localize import cam_depth_to_plane_m, corner_uv_to_base
+
+            def _detect_stationary(
+                *,
+                side: str,
+                corner_idx: int,
+                corner_xy: Sequence[float],
+                grab_fn,
+                motion_backend,
+                T_tc: np.ndarray,
+            ) -> tuple[list[float] | None, PcbDetection | None, np.ndarray | None]:
+                if grab_fn is None or motion_backend is None:
+                    return None, None, None
+                if self._wrist_K is None:
+                    return None, None, None
+                try:
+                    ee = list(motion_backend.get_flange_pose()[:6])
+                    wrist_bgr, _wd = grab_fn()
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("LARGE plan_only %s grab/TCP fail: %s", side, exc)
+                    return None, None, None
+                if side.startswith("l"):
+                    self._last_wrist_bgr = wrist_bgr
+                T_base_cam = pose_xyz_rpy_to_mat4(*[float(x) for x in ee[:6]]) @ T_tc
+                try:
+                    cam_depth = cam_depth_to_plane_m(T_base_cam, z_board)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("LARGE plan_only %s cam_depth fail: %s", side, exc)
+                    return None, None, wrist_bgr
+                dets = det_model.detect(wrist_bgr)
+                if not dets:
+                    LOG.info("LARGE plan_only %s: 腕图未检出角点", side)
+                    if save_vis_dir is not None:
+                        try:
+                            import cv2
+
+                            out_w = Path(save_vis_dir) / "wrist"
+                            out_w.mkdir(parents=True, exist_ok=True)
+                            vis = wrist_bgr.copy()
+                            cv2.putText(
+                                vis,
+                                f"LARGE plan_only {side} P{corner_idx} NO DET",
+                                (8, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                (0, 0, 255),
+                                2,
+                            )
+                            name = (
+                                "pose_left.jpg"
+                                if side.startswith("l")
+                                else "pose_right.jpg"
+                            )
+                            cv2.imwrite(str(out_w / name), vis)
+                            if side.startswith("l"):
+                                self._last_wrist_fine_left_vis = vis
+                            else:
+                                self._last_wrist_fine_right_vis = vis
+                            self._last_wrist_pose_vis = vis
+                        except Exception:
+                            pass
+                    return None, None, wrist_bgr
+                best_d = 1e9
+                best_xyz: list[float] | None = None
+                best_det: PcbDetection | None = None
+                for d in dets:
+                    if not d.corners:
+                        continue
+                    u, v = d.corners[0]
+                    try:
+                        xyz = corner_uv_to_base(
+                            float(u),
+                            float(v),
+                            T_base_cam=T_base_cam,
+                            K=self._wrist_K,
+                            fixed_depth_cam_m=float(cam_depth),
+                        )
+                    except Exception:
+                        continue
+                    dxy = math.hypot(
+                        float(xyz[0]) - float(corner_xy[0]),
+                        float(xyz[1]) - float(corner_xy[1]),
+                    )
+                    if dxy < best_d:
+                        best_d = dxy
+                        best_xyz = [
+                            float(xyz[0]),
+                            float(xyz[1]),
+                            float(z_board),
+                        ]
+                        best_det = d
+                if best_xyz is None or best_d > max_d:
+                    LOG.info(
+                        "LARGE plan_only %s: 检出但 Δcoarse=%.1fmm > max_d → 不用",
+                        side,
+                        best_d * 1000.0 if best_xyz is not None else -1.0,
+                    )
+                    return None, best_det, wrist_bgr
+                LOG.info(
+                    "LARGE plan_only %s OK P%d=(%.4f,%.4f) Δcoarse=%.1fmm conf=%.2f",
+                    side,
+                    corner_idx,
+                    best_xyz[0],
+                    best_xyz[1],
+                    best_d * 1000.0,
+                    float(getattr(best_det, "conf", 0.0) or 0.0),
+                )
+                try:
+                    vis = draw_pose_vis(
+                        wrist_bgr,
+                        best_det,
+                        title=(
+                            f"LARGE plan_only {side} P{corner_idx} "
+                            f"Δ={best_d*1000:.0f}mm"
+                        ),
+                    )
+                    self._last_wrist_pose_vis = vis
+                    if side.startswith("l"):
+                        self._last_wrist_fine_left_vis = vis
+                    else:
+                        self._last_wrist_fine_right_vis = vis
+                    if save_vis_dir is not None:
+                        import cv2
+
+                        out_w = Path(save_vis_dir) / "wrist"
+                        out_w.mkdir(parents=True, exist_ok=True)
+                        name = (
+                            "pose_left.jpg"
+                            if side.startswith("l")
+                            else "pose_right.jpg"
+                        )
+                        cv2.imwrite(str(out_w / name), vis)
+                        cv2.imwrite(str(out_w / "color.jpg"), wrist_bgr)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("LARGE plan_only %s vis fail: %s", side, exc)
+                return best_xyz, best_det, wrist_bgr
+
+            LOG.info(
+                "LARGE fine plan_only: 不动臂，用当前腕图试认 P2/P3 "
+                "(能认出则产出 tip)"
+            )
+            fine_p3, _d3, _b3 = _detect_stationary(
+                side="left",
+                corner_idx=3,
+                corner_xy=p3_c,
+                grab_fn=grab_wrist,
+                motion_backend=left_motion or self.motion,
+                T_tc=T_left,
+            )
+            fine_p2 = None
+            r_motion = right_motion
+            use_right = (
+                r_motion is not None
+                and not bool(getattr(r_motion, "dry_run", False))
+            )
+            if use_right:
+                try:
+                    grab_fn_r = _ensure_grab_right()
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("LARGE plan_only: 开右腕失败: %s", exc)
+                    grab_fn_r = None
+                if grab_fn_r is not None:
+                    fine_p2, _d2, _b2 = _detect_stationary(
+                        side="right",
+                        corner_idx=2,
+                        corner_xy=p2_c,
+                        grab_fn=grab_fn_r,
+                        motion_backend=r_motion,
+                        T_tc=T_right,
+                    )
+            if fine_p2 is None:
+                # 未连右臂 / 右腕未认出：同一左腕图再匹配 P2（视野里有则用）
+                fine_p2, _d2, _b2 = _detect_stationary(
+                    side="left",
+                    corner_idx=2,
+                    corner_xy=p2_c,
+                    grab_fn=grab_wrist,
+                    motion_backend=left_motion or self.motion,
+                    T_tc=T_left,
+                )
+            if right_cam is not None:
+                try:
+                    right_cam.close()
+                except Exception:
+                    pass
+            if fine_p3 is None and fine_p2 is None:
+                LOG.info("LARGE plan_only: 腕部未认出角点 → 不产出 tip")
+                return coarse
+            new_corners = [list(c) for c in coarse.corners_base]
+            if fine_p3 is not None:
+                new_corners[3] = list(fine_p3)
+            if fine_p2 is not None:
+                new_corners[2] = list(fine_p2)
+            new_corners[2][2] = z_board
+            new_corners[3][2] = z_board
+            z_board_out = 0.5 * (
+                float(new_corners[2][2]) + float(new_corners[3][2])
+            )
+            rz = gripper_rz_large_parallel_p2p3(
+                new_corners[2],
+                new_corners[3],
+                orient_rz_offset_deg=float(
+                    getattr(self.cfg, "large_orient_rz_offset_deg", 0.0) or 0.0
+                ),
+            )
+            mid_x = 0.5 * (float(new_corners[2][0]) + float(new_corners[3][0]))
+            mid_y = 0.5 * (float(new_corners[2][1]) + float(new_corners[3][1]))
+            refined = _OP(
+                x=mid_x,
+                y=mid_y,
+                z=float(z_board_out),
+                rz=float(rz),
+                edge_yaw=math.atan2(
+                    float(new_corners[3][1]) - float(new_corners[2][1]),
+                    float(new_corners[3][0]) - float(new_corners[2][0]),
+                ),
+                corners_base=new_corners,
+                conf=float(coarse.conf),
+                board_id=coarse.board_id,
+                cls_id=int(self.cfg.cls_pcb_large),
+            )
+            LOG.info(
+                "LARGE plan_only fine OK id=%s mid23=(%.4f,%.4f) "
+                "P2%s P3%s",
+                refined.board_id,
+                refined.x,
+                refined.y,
+                "=腕" if fine_p2 is not None else "=粗",
+                "=腕" if fine_p3 is not None else "=粗",
+            )
+            self._large_wrist_fine_ok = True
+            return refined
 
         def _pick_corner(
             *,
             side: str,
             corner_idx: int,
-            target_xy: Sequence[float],
+            hover_xy: Sequence[float],
+            corner_xy: Sequence[float],
+            z_arrive: float,
             grab_fn,
             motion_backend,
             T_tc: np.ndarray,
             home_flange: Sequence[float] | None,
         ) -> tuple[list[float] | None, PcbDetection | None, np.ndarray | None]:
-            """相机到角点上方 → 检测 → ID 匹配 → 取角点 → 回 home。"""
-            hover_obj = _OP(
-                x=float(target_xy[0]),
-                y=float(target_xy[1]),
-                z=float(grasp_z_m),
-                rz=float(coarse.rz),
-                edge_yaw=float(coarse.edge_yaw),
-                corners_base=[list(c) for c in coarse.corners_base],
-                conf=float(coarse.conf),
-                board_id=coarse.board_id,
-                cls_id=int(getattr(coarse, "cls_id", self.cfg.cls_pcb_large) or 0),
-            )
-            cur = None
-            try:
-                cur = list(motion_backend.get_flange_pose()[:6])
-            except Exception:
-                cur = list(home_flange) if home_flange is not None else None
-            hover = self.flange_above_camera_down(
-                hover_obj,
-                z_override=z_cam,
-                current_flange=cur,
-                T_tool_cam=T_tc,
+            """粗定位到达：末端在角点 XY、Z=grasp_z+hover（左右统一），夹爪垂直向下。"""
+            hover = tip_to_flange(
+                [float(hover_xy[0]), float(hover_xy[1]), float(z_arrive)],
+                gripper_rz=float(grip_rz),
+                grasp_ux=grasp_ux,
+                grasp_uy=grasp_uy,
+                side=side,
+                tool_y_m=0.0,
+                tool_z_m=0.0,
             )
             LOG.info(
-                "PHASE: LARGE fine %s → P%d above (%.3f,%.3f,%.3f)",
+                "PHASE: LARGE 粗定位到达 %s P%d tipXYZ=(%.3f,%.3f,%.3f) "
+                "rpy_deg=(%.1f,%.1f,%.1f) (末端垂直向下 · grasp_z+%.2f)",
                 side,
                 corner_idx,
-                hover[0],
-                hover[1],
-                hover[2],
+                float(hover[0]),
+                float(hover[1]),
+                float(hover[2]),
+                float(hover[3]) * 180.0 / math.pi,
+                float(hover[4]) * 180.0 / math.pi,
+                float(hover[5]) * 180.0 / math.pi,
+                hover_h,
             )
             motion_backend.move_line(
                 hover, velocity_scale=float(self.cfg.move_velocity_scale)
@@ -634,68 +963,77 @@ class GraspPipeline:
                             *[float(x) for x in ee[:6]]
                         )
                         T_base_cam = T_base_tool @ T_tc
-                        fine_poses: list[ObjectPose] = []
-                        ok_dets: list[PcbDetection] = []
+                        cam_depth = cam_depth_to_plane_m(T_base_cam, z_board)
+                        LOG.info(
+                            "LARGE fine %s frame %d camZ=%.3f depth_to_z%.3f=%.3f "
+                            "n_det=%d",
+                            side,
+                            fi + 1,
+                            float(T_base_cam[2, 3]),
+                            z_board,
+                            cam_depth,
+                            len(dets),
+                        )
+                        # V2·220e76：每检出=一个角点；取距粗 P2/P3 最近且 ≤max_d
+                        best_d = 1e9
+                        best_xyz: list[float] | None = None
+                        best_det: PcbDetection | None = None
                         for d in dets:
+                            if not d.corners:
+                                continue
+                            u, v = d.corners[0]
                             try:
-                                pose = corners_to_object_pose(
-                                    d,
+                                xyz = corner_uv_to_base(
+                                    float(u),
+                                    float(v),
                                     T_base_cam=T_base_cam,
                                     K=self._wrist_K,
-                                    tray_z_m=float(grasp_z_m),
-                                    kp_i=2,
-                                    kp_j=3,
+                                    fixed_depth_cam_m=float(cam_depth),
                                 )
-                                pose.cls_id = int(getattr(d, "cls_id", 0) or 0)
-                                fine_poses.append(pose)
-                                ok_dets.append(d)
                             except Exception as exc:  # noqa: BLE001
                                 LOG.warning(
                                     "LARGE fine %s lift fail: %s", side, exc
                                 )
-                        if fine_poses:
-                            matched = match_fine_to_coarse(
-                                fine_poses, coarse_boards, max_dist_m=max_d
+                                continue
+                            dxy = math.hypot(
+                                float(xyz[0]) - float(corner_xy[0]),
+                                float(xyz[1]) - float(corner_xy[1]),
                             )
-                            picked = None
-                            picked_det = None
-                            if tid is not None:
-                                for d, p in zip(ok_dets, matched):
-                                    if p.board_id == tid:
-                                        picked = p
-                                        picked_det = d
-                                        break
-                            if picked is None:
-                                best_d = 1e9
-                                for d, p in zip(ok_dets, fine_poses):
-                                    if len(p.corners_base) <= corner_idx:
-                                        continue
-                                    cxy = p.corners_base[corner_idx]
-                                    dxy = math.hypot(
-                                        float(cxy[0]) - float(target_xy[0]),
-                                        float(cxy[1]) - float(target_xy[1]),
-                                    )
-                                    if dxy < best_d:
-                                        best_d = dxy
-                                        picked = p
-                                        picked_det = d
-                            if (
-                                picked is not None
-                                and len(picked.corners_base) > corner_idx
-                            ):
-                                c_fine = picked.corners_base[corner_idx]
-                                corner_samples.append(
-                                    [
-                                        float(c_fine[0]),
-                                        float(c_fine[1]),
-                                        float(grasp_z_m),
-                                    ]
-                                )
-                                det_samples.append(picked_det or ok_dets[0])
-                                bgr_samples.append(wrist_bgr)
-                                if side.startswith("l"):
-                                    self._last_fine_dets = list(ok_dets)
-                                    self._last_fine_boards = list(matched)
+                            if dxy < best_d:
+                                best_d = dxy
+                                best_xyz = [
+                                    float(xyz[0]),
+                                    float(xyz[1]),
+                                    float(z_board),
+                                ]
+                                best_det = d
+                        if best_xyz is not None and best_d <= max_d:
+                            corner_samples.append(best_xyz)
+                            det_samples.append(best_det)  # type: ignore[arg-type]
+                            bgr_samples.append(wrist_bgr)
+                            if side.startswith("l"):
+                                self._last_fine_dets = list(dets)
+                                self._last_fine_boards = []
+                            LOG.info(
+                                "LARGE fine %s frame %d/%d: P%d cand "
+                                "Δcoarse=%.1fmm conf=%.2f",
+                                side,
+                                fi + 1,
+                                n_f,
+                                corner_idx,
+                                best_d * 1000.0,
+                                float(getattr(best_det, "conf", 0.0) or 0.0),
+                            )
+                        elif best_xyz is not None:
+                            LOG.warning(
+                                "LARGE fine %s frame %d/%d: 最近角点 "
+                                "Δ=%.1fmm > max_d=%.0fmm → 丢弃",
+                                side,
+                                fi + 1,
+                                n_f,
+                                best_d * 1000.0,
+                                max_d * 1000.0,
+                            )
                     if gap_f > 0 and fi + 1 < n_f:
                         _time.sleep(gap_f)
 
@@ -703,6 +1041,40 @@ class GraspPipeline:
                     LOG.warning(
                         "LARGE fine %s: %d 帧均无有效 P%d", side, n_f, corner_idx
                     )
+                    # 无检出也落盘最后一帧，方便看高度/视野
+                    if save_vis_dir is not None and wrist_bgr is not None:
+                        try:
+                            import cv2
+
+                            out_w = Path(save_vis_dir) / "wrist"
+                            out_w.mkdir(parents=True, exist_ok=True)
+                            vis = wrist_bgr.copy()
+                            cv2.putText(
+                                vis,
+                                f"LARGE {side} fine P{corner_idx} NO DET",
+                                (8, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                (0, 0, 255),
+                                2,
+                            )
+                            name = (
+                                "pose_left.jpg"
+                                if side.startswith("l")
+                                else "pose_right.jpg"
+                            )
+                            cv2.imwrite(str(out_w / name), vis)
+                            cv2.imwrite(str(out_w / "color.jpg"), wrist_bgr)
+                            if side.startswith("l"):
+                                self._last_wrist_fine_left_vis = vis
+                            else:
+                                self._last_wrist_fine_right_vis = vis
+                            self._last_wrist_pose_vis = vis
+                            LOG.info("LARGE fine saved %s/%s (no det)", out_w, name)
+                        except Exception as exc:  # noqa: BLE001
+                            LOG.warning(
+                                "LARGE fine %s save no-det vis failed: %s", side, exc
+                            )
                 else:
                     corner_xyz, pi, _km = pick_closest_to_mean_xyz(
                         corner_samples, mad_k=mad_k
@@ -710,8 +1082,8 @@ class GraspPipeline:
                     used_det = det_samples[pi]
                     bgr_out = bgr_samples[pi]
                     d_c = math.hypot(
-                        corner_xyz[0] - float(target_xy[0]),
-                        corner_xyz[1] - float(target_xy[1]),
+                        corner_xyz[0] - float(corner_xy[0]),
+                        corner_xyz[1] - float(corner_xy[1]),
                     )
                     LOG.info(
                         "LARGE fine %s OK P%d=(%.4f,%.4f) pick#%d/%d "
@@ -725,7 +1097,7 @@ class GraspPipeline:
                         d_c * 1000.0,
                     )
                     try:
-                        self._last_wrist_pose_vis = draw_pose_vis(
+                        vis = draw_pose_vis(
                             bgr_out,
                             used_det,
                             title=(
@@ -733,8 +1105,28 @@ class GraspPipeline:
                                 f"pick#{pi + 1}/{len(corner_samples)} id={tid}"
                             ),
                         )
-                    except Exception:
-                        pass
+                        self._last_wrist_pose_vis = vis
+                        if side.startswith("l"):
+                            self._last_wrist_fine_left_vis = vis
+                        else:
+                            self._last_wrist_fine_right_vis = vis
+                        if save_vis_dir is not None:
+                            import cv2
+
+                            out_w = Path(save_vis_dir) / "wrist"
+                            out_w.mkdir(parents=True, exist_ok=True)
+                            name = (
+                                "pose_left.jpg"
+                                if side.startswith("l")
+                                else "pose_right.jpg"
+                            )
+                            cv2.imwrite(str(out_w / name), vis)
+                            cv2.imwrite(str(out_w / "pose.jpg"), vis)
+                            if bgr_out is not None:
+                                cv2.imwrite(str(out_w / "color.jpg"), bgr_out)
+                            LOG.info("LARGE fine saved %s/%s", out_w, name)
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("LARGE fine %s save vis failed: %s", side, exc)
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("LARGE fine %s detect failed: %s", side, exc)
             finally:
@@ -751,11 +1143,21 @@ class GraspPipeline:
             return corner_xyz, used_det, bgr_out
 
         fine_p3 = fine_p2 = None
+        # 右腕相机提前开好，避免左臂拍完再连相机空等
+        grab_fn_r = None
+        if right_motion is not None:
+            try:
+                grab_fn_r = _ensure_grab_right()
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("LARGE fine: 开右腕相机失败: %s → 跳过 P2", exc)
+                grab_fn_r = None
         try:
             fine_p3, _d3, _b3 = _pick_corner(
                 side="left",
                 corner_idx=3,
-                target_xy=p3_c,
+                hover_xy=hover_p3,
+                corner_xy=p3_c,
+                z_arrive=z_p3_arrive,
                 grab_fn=grab_wrist,
                 motion_backend=left_motion,
                 T_tc=T_left,
@@ -763,22 +1165,18 @@ class GraspPipeline:
             )
             if right_motion is None:
                 LOG.warning("LARGE fine: 无右臂 motion → 跳过 P2 精定位")
-            else:
-                try:
-                    grab_fn_r = _ensure_grab_right()
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning("LARGE fine: 开右腕相机失败: %s → 跳过 P2", exc)
-                    grab_fn_r = None
-                if grab_fn_r is not None:
-                    fine_p2, _d2, _b2 = _pick_corner(
-                        side="right",
-                        corner_idx=2,
-                        target_xy=p2_c,
-                        grab_fn=grab_fn_r,
-                        motion_backend=right_motion,
-                        T_tc=T_right,
-                        home_flange=coarse_fl_r,
-                    )
+            elif grab_fn_r is not None:
+                fine_p2, _d2, _b2 = _pick_corner(
+                    side="right",
+                    corner_idx=2,
+                    hover_xy=hover_p2,
+                    corner_xy=p2_c,
+                    z_arrive=z_p2_arrive,
+                    grab_fn=grab_fn_r,
+                    motion_backend=right_motion,
+                    T_tc=T_right,
+                    home_flange=coarse_fl_r,
+                )
         finally:
             if right_cam is not None:
                 try:
@@ -786,20 +1184,31 @@ class GraspPipeline:
                 except Exception:
                     pass
 
+        # 未检出则直接报错，禁止继续接近/夹取移动
+        miss: list[str] = []
+        if fine_p3 is None:
+            miss.append("左腕P3")
+        if right_motion is not None and fine_p2 is None:
+            miss.append("右腕P2")
+        if miss:
+            raise RuntimeError(
+                "大板腕精定位未识别到角点："
+                + "、".join(miss)
+                + "（模型 V2·220e76）。已中止，不再做精定位接近/夹取移动。"
+            )
+
         new_corners = [list(c) for c in coarse.corners_base]
-        used_fine = False
-        if fine_p3 is not None:
-            new_corners[3] = list(fine_p3)
-            used_fine = True
-        else:
-            new_corners[3][2] = float(grasp_z_m)
-            LOG.warning("LARGE fine: 无精 P3 → 保留粗 P3")
+        new_corners[3] = list(fine_p3)
         if fine_p2 is not None:
             new_corners[2] = list(fine_p2)
-            used_fine = True
         else:
-            new_corners[2][2] = float(grasp_z_m)
-            LOG.warning("LARGE fine: 无精 P2 → 保留粗 P2")
+            LOG.warning("LARGE fine: 无右臂 → P2 保留粗 XY，Z=FFS")
+        # 夹取高度写死；精定位只提供 XY
+        new_corners[2][2] = z_board
+        new_corners[3][2] = z_board
+        z_board_out = 0.5 * (
+            float(new_corners[2][2]) + float(new_corners[3][2])
+        )
 
         rz = gripper_rz_large_parallel_p2p3(
             new_corners[2],
@@ -813,7 +1222,7 @@ class GraspPipeline:
         refined = _OP(
             x=mid_x,
             y=mid_y,
-            z=float(grasp_z_m),
+            z=float(z_board_out),
             rz=float(rz),
             edge_yaw=math.atan2(
                 float(new_corners[3][1]) - float(new_corners[2][1]),
@@ -825,9 +1234,8 @@ class GraspPipeline:
             cls_id=int(self.cfg.cls_pcb_large),
         )
         LOG.info(
-            "LARGE fine merge%s id=%s mid23=(%.4f,%.4f) rz=%.1f° "
+            "LARGE fine merge OK id=%s mid23=(%.4f,%.4f) rz=%.1f° "
             "P2=(%.4f,%.4f) P3=(%.4f,%.4f)",
-            " OK" if used_fine else " (coarse fallback)",
             refined.board_id,
             refined.x,
             refined.y,
@@ -837,6 +1245,7 @@ class GraspPipeline:
             new_corners[3][0],
             new_corners[3][1],
         )
+        self._large_wrist_fine_ok = True
         return refined
 
     # ------------------------------------------------------------------- motion
@@ -1152,7 +1561,6 @@ class GraspPipeline:
         )
         est = self._ensure_stereo_depth()
 
-        # 每帧：深度对齐检测 → 多板 ID → 选抓取目标；再滤异常取最接近均值的那帧
         samples: list[dict] = []
         LOG.info(
             "HEAD multi-frame n=%d mad_k=%.1f → pick closest-to-mean (target_rank=%d)",
@@ -1247,7 +1655,7 @@ class GraspPipeline:
             raise RuntimeError(f"Head: no valid PCB in {n} frames")
 
         tgt_poses = [s["target"] for s in samples]
-        picked, pick_i, keep, mean_xyz = pick_closest_to_mean_pose(
+        _picked, pick_i, keep, mean_xyz = pick_closest_to_mean_pose(
             tgt_poses, mad_k=mad_k
         )
         samp = samples[pick_i]
@@ -1258,11 +1666,50 @@ class GraspPipeline:
         depth_stats = samp["depth_stats"]
         boards = samp["boards"]
         dets_ranked = samp["dets"]
-        target = picked
-        # 保留该帧真实位姿（角点等），仅同步 ID/cls
+        tgt_det = samp["tgt_det"]
+        # 每个角点自己在 N 帧里的深度中位数（只计 <1m），不用四角互相替换。
+        n_c = len(tgt_det.corners)
+        buckets: list[list[float]] = [[] for _ in range(n_c)]
+        for s in samples:
+            det_s = s["tgt_det"]
+            if len(det_s.corners) < n_c:
+                continue
+            for j, (u, v) in enumerate(det_s.corners[:n_c]):
+                z = sample_depth_m(s["depth"], float(u), float(v), z_max=1.0)
+                if z is not None:
+                    buckets[j].append(float(z))
+        tgt_cls = int(getattr(samp["target"], "cls_id", 0) or 0)
+        required = (
+            {2, 3}
+            if tgt_cls == int(self.cfg.cls_pcb_large)
+            else set(range(n_c))
+        )
+        meds: list[float] = []
+        for j, zs in enumerate(buckets):
+            if not zs and j in required:
+                raise RuntimeError(
+                    f"Head corner P{j}: no depth <1m across {len(samples)} frames"
+                )
+            if zs:
+                meds.append(float(np.median(np.asarray(zs, dtype=np.float64))))
+            else:
+                meds.append(float("nan"))
+        have = [z for j, z in enumerate(meds) if j in required]
+        fill = float(sorted(have)[len(have) // 2])
+        meds = [fill if z != z else z for z in meds]
+        LOG.info(
+            "HEAD per-corner depth median over %d frames: %s counts=%s",
+            len(samples),
+            [round(z, 3) for z in meds],
+            [len(zs) for zs in buckets],
+        )
+        target = self._head_localize_det(tgt_det, depth_m_per_corner=meds)
         target.board_id = samp["target"].board_id
         target.cls_id = int(getattr(samp["target"], "cls_id", 0) or 0)
-        tgt_det = samp["tgt_det"]
+        boards = [
+            target if getattr(b, "board_id", None) == target.board_id else b
+            for b in boards
+        ]
         tid_grasp = int(target.board_id) if target.board_id is not None else int(tid)
         best_i = int(samp["i"])
 
@@ -1776,7 +2223,9 @@ class GraspPipeline:
                 base,
                 points,
                 K=self._head_K,
-                T_base_cam=self.cfg.T_base_cam,
+                T_base_cam=self._T_base_head
+                if self._T_base_head is not None
+                else self.cfg.T_base_cam,
                 title=title or "grasp←base (handeye)",
             )
         except Exception as exc:  # noqa: BLE001
@@ -1826,6 +2275,8 @@ class GraspPipeline:
             head_depth_u16_mm=self._last_head_depth_u16,
             head_depth_stats=self._last_head_depth_stats,
             wrist_pose_vis=self._last_wrist_pose_vis,
+            wrist_pose_left_vis=getattr(self, "_last_wrist_fine_left_vis", None),
+            wrist_pose_right_vis=getattr(self, "_last_wrist_fine_right_vis", None),
             wrist_match_vis=self._last_wrist_match_vis,
             wrist_color=self._last_wrist_bgr,
             wrist_depth=self._last_wrist_depth,
@@ -1886,13 +2337,13 @@ class GraspPipeline:
         """大板单臂支路 B：无头相机。
 
         1) 左臂到 ``single_arm.coarse_flange_pose``（未配则当前 TCP）
-        2) 腕部拍照粗定位（corner 84d205）→ 可视化叠在这张粗图上
+        2) 腕部拍照粗定位（corner 220e76）→ 可视化叠在这张粗图上
         3) 精定位：左臂依次到粗 P3 / P2 上方 → 合成精 2/3
         4) 停在 mid(P2,P3)；``stop_z_m`` 未配则只规划不强制落到写死高度
         """
         from .geometry import pose_xyz_rpy_to_mat4
         from .large_board import gripper_rz_large_parallel_p2p3
-        from .localize import corners_to_object_pose
+        from .localize import corner_uv_to_base, corners_to_object_pose
 
         def _progress(phase: str) -> None:
             if on_progress is None:
@@ -1910,7 +2361,7 @@ class GraspPipeline:
 
         det_model = self._ensure_large_wrist_det()
         if det_model is None:
-            result.message = "未配置 large_board.wrist_pose_weights（84d205）"
+            result.message = "未配置 large_board.wrist_pose_weights（220e76）"
             return result
 
         grasp_z = getattr(self.cfg, "large_grasp_z_m", None)
@@ -1926,7 +2377,7 @@ class GraspPipeline:
         hover_h = getattr(self.cfg, "large_single_fine_hover_height_m", None)
         if hover_h is None:
             hover_h = float(
-                getattr(self.cfg, "large_fine_hover_height_m", 0.10) or 0.10
+                getattr(self.cfg, "large_fine_hover_height_m", 0.35) or 0.35
             )
         else:
             hover_h = float(hover_h)
@@ -2127,21 +2578,21 @@ class GraspPipeline:
                         dets = det_model.detect(wb)
                         best = None
                         best_d = 1e9
+                        # 单角模型：每检出一点；取距粗目标最近
                         for d in dets or []:
+                            if not d.corners:
+                                continue
+                            u, v = d.corners[0]
                             try:
-                                pose = corners_to_object_pose(
-                                    d,
+                                cxy = corner_uv_to_base(
+                                    float(u),
+                                    float(v),
                                     T_base_cam=T_bc,
                                     K=self._wrist_K,
                                     tray_z_m=float(grasp_z),
-                                    kp_i=2,
-                                    kp_j=3,
                                 )
                             except Exception:
                                 continue
-                            if len(pose.corners_base) <= corner_idx:
-                                continue
-                            cxy = pose.corners_base[corner_idx]
                             dxy = math.hypot(
                                 float(cxy[0]) - float(target_xy[0]),
                                 float(cxy[1]) - float(target_xy[1]),
@@ -2470,86 +2921,85 @@ class GraspPipeline:
                     },
                     save_wrist_pred=False,
                 )
-            _progress("coarse")
-
             # —— 2. 接近（按 mode）——
             d_xy = 0.0
             d_xyz = 0.0
             if grasp_mode == "large":
                 tool_z = float(self.cfg.large_tool_z_m)
-                # 夹取高度：默认两臂法兰 Z = 左臂当前高度 → tipZ = 左臂Z − tool_z
-                grasp_z_tip = self.cfg.large_grasp_z_m
-                z_src = "calib_grasp_z_m"
-                if bool(getattr(self.cfg, "large_use_left_current_z", True)):
-                    cur_l = result.current_flange
-                    if cur_l is None or len(cur_l) < 3:
-                        try:
-                            cur_l = list(self.motion.get_flange_pose()[:6])
-                            result.current_flange = cur_l
-                        except Exception:  # noqa: BLE001
-                            cur_l = None
-                    if cur_l is not None and len(cur_l) >= 3:
-                        flange_z = float(cur_l[2])
-                        grasp_z_tip = flange_z - tool_z
-                        z_src = "left_current_flange_z"
-                        LOG.info(
-                            "LARGE grasp height from left arm: flangeZ=%.4f → tipZ=%.4f "
-                            "(both arms)",
-                            flange_z,
-                            float(grasp_z_tip),
-                        )
-                    else:
-                        LOG.warning(
-                            "LARGE use_left_current_z 但读不到左臂位姿 → 回退 grasp_z_m/tray"
-                        )
-                # 大板：角点按 tip/板面高度固定平面求交（不用头深）
-                if head_det is not None and bool(
-                    getattr(self.cfg, "large_use_fixed_grasp_z_plane", True)
-                ):
-                    z_plane = (
-                        float(grasp_z_tip)
-                        if grasp_z_tip is not None
-                        else self._plane_z_for_cls(int(self.cfg.cls_pcb_large))
+                grasp_z_fixed = getattr(self.cfg, "large_grasp_z_m", None)
+                if grasp_z_fixed is None:
+                    raise RuntimeError("large_board.grasp_z_m 未写死")
+                grasp_z_tip = float(grasp_z_fixed)
+                z_src = "grasp_z_m"
+                LOG.info(
+                    "LARGE tipZ=写死 %.4f；粗到位=角点XY / grasp_z+%.0fcm（统一）；"
+                    "腕精深度=当前相机到该高度，夹取 XY=角点+dx/±dy",
+                    float(grasp_z_tip),
+                    float(
+                        getattr(self.cfg, "large_fine_hover_height_m", 0.35) or 0.35
                     )
-                    try:
-                        coarse_lg = self._head_localize_det(
-                            head_det, depth=None, tray_z_m=z_plane
-                        )
-                        coarse_lg.board_id = coarse.board_id
-                        coarse_lg.cls_id = int(self.cfg.cls_pcb_large)
-                        coarse = coarse_lg
-                        result.coarse = coarse
-                        # 同步更新粗定位板列表中目标板的基座角点（标签用）
-                        boards = list(getattr(self, "_last_coarse_boards", []) or [])
-                        for i, b in enumerate(boards):
-                            if b.board_id == coarse.board_id:
-                                boards[i] = coarse
-                                break
-                        self._last_coarse_boards = boards
-                        result.coarse_boards = list(boards)
-                        LOG.info(
-                            "LARGE fixed-plane z=%.4f (%s) → %s",
-                            z_plane,
-                            z_src,
-                            format_pose(coarse),
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        LOG.warning("LARGE re-localize on grasp_z plane failed: %s", exc)
-                # 腕精：到 mid(P0,P3) 上方 → 按 ID 匹配 → 精 0/3 替换粗 0/3
-                z_for_fine = (
-                    float(grasp_z_tip)
-                    if grasp_z_tip is not None
-                    else self._plane_z_for_cls(int(self.cfg.cls_pcb_large))
+                    * 100.0,
                 )
+                if coarse.corners_base is not None and len(coarse.corners_base) >= 4:
+                    from .large_board import gripper_rz_large_parallel_p2p3, tip_to_flange
+
+                    hover_h = float(
+                        getattr(self.cfg, "large_fine_hover_height_m", 0.35) or 0.35
+                    )
+                    z_arrive = float(grasp_z_tip) + hover_h
+                    p2c = coarse.corners_base[2]
+                    p3c = coarse.corners_base[3]
+                    grip_rz = gripper_rz_large_parallel_p2p3(
+                        p2c,
+                        p3c,
+                        orient_rz_offset_deg=float(
+                            getattr(self.cfg, "large_orient_rz_offset_deg", 0.0) or 0.0
+                        ),
+                    )
+                    ux = float(p2c[0] - p3c[0])
+                    uy = float(p2c[1] - p3c[1])
+                    nrm = math.hypot(ux, uy) or 1.0
+                    left_arrive = tip_to_flange(
+                        [float(p3c[0]), float(p3c[1]), z_arrive],
+                        gripper_rz=grip_rz,
+                        grasp_ux=ux / nrm,
+                        grasp_uy=uy / nrm,
+                        side="left",
+                        tool_y_m=0.0,
+                        tool_z_m=0.0,
+                    )
+                    right_arrive = tip_to_flange(
+                        [float(p2c[0]), float(p2c[1]), z_arrive],
+                        gripper_rz=grip_rz,
+                        grasp_ux=ux / nrm,
+                        grasp_uy=uy / nrm,
+                        side="right",
+                        tool_y_m=0.0,
+                        tool_z_m=0.0,
+                    )
+                    _announce_targets(
+                        "粗定位完成 · 下一步末端目标",
+                        [("左臂 P3", left_arrive), ("右臂 P2", right_arrive)],
+                    )
+                    result.hover_flange = list(left_arrive)
+                    result.coarse_flange = list(left_arrive)
+                    result.debug = {
+                        **(result.debug or {}),
+                        "coarse_left": list(left_arrive),
+                        "coarse_right": list(right_arrive),
+                    }
+                _progress("coarse")
+                z_for_fine = float(grasp_z_tip)
                 try:
                     coarse = self.refine_large_board_p0p3(
                         coarse,
                         grab_wrist,
                         grasp_z_m=z_for_fine,
                         plan_only=bool(plan_only),
+                        save_vis_dir=save_vis_dir,
                     )
                     result.coarse = coarse
-                    result.fine = coarse  # 大板「精」= 刷新后的 0/3 几何
+                    result.fine = coarse  # 大板「精」= 刷新后的 2/3 几何
                     result.fine_boards = list(
                         getattr(self, "_last_fine_boards", []) or []
                     )
@@ -2558,6 +3008,9 @@ class GraspPipeline:
                         "grasp_mode": grasp_mode,
                         "stage": "after_large_fine",
                         "live": True,
+                        "wrist_fine_ok": bool(
+                            getattr(self, "_large_wrist_fine_ok", False)
+                        ),
                     }
                     if save_vis_dir:
                         self._save_stage_vis(
@@ -2569,11 +3022,9 @@ class GraspPipeline:
                                 "stage": "after_large_fine",
                             },
                         )
-                    _progress("fine")
                 except Exception as exc:  # noqa: BLE001
-                    LOG.warning("LARGE fine refine failed: %s → keep coarse", exc)
+                    LOG.error("LARGE fine failed → 中止，不做接近: %s", exc)
                     if save_vis_dir and self._last_wrist_bgr is not None:
-                        # 失败也尽量留下腕原图（可能无检出）
                         self._save_stage_vis(
                             Path(save_vis_dir),
                             head_rect=rect,
@@ -2583,6 +3034,61 @@ class GraspPipeline:
                                 "stage": "after_large_fine_failed",
                             },
                         )
+                    result.ok = False
+                    result.message = str(exc)
+                    result.debug = {
+                        **(result.debug or {}),
+                        "grasp_mode": grasp_mode,
+                        "stage": "large_fine_failed",
+                        "live": True,
+                        "wrist_fine_ok": False,
+                        "error": str(exc),
+                    }
+                    return result
+                # tip 只来自腕精认出的 P2/P3；跳过/未识别时只保留粗定位「接近」
+                if not bool(getattr(self, "_large_wrist_fine_ok", False)):
+                    LOG.info(
+                        "LARGE: 腕精未完成 → 不产出 tip（不伪造头粗角点）"
+                    )
+                    result.fine = None
+                    result.debug = {
+                        **(result.debug or {}),
+                        "grasp_mode": grasp_mode,
+                        "stage": "plan_only_coarse_only"
+                        if plan_only
+                        else "coarse_only_no_tip",
+                        "live": True,
+                        "move": False,
+                        "wrist_fine_ok": False,
+                        "left_grasp": None,
+                        "right_grasp": None,
+                        "left_approach": None,
+                        "right_approach": None,
+                    }
+                    result.ok = True
+                    result.message = (
+                        "粗定位完成；tip 需腕精认出角点后才有"
+                        + ("（只定位：当前腕图未认出）" if plan_only else "")
+                    )
+                    return result
+                # 夹取 / 接近高度保持写死的 grasp_z；精定位只更新角点 XY
+                app_h = getattr(self.cfg, "large_approach_hover_height_m", 0.0)
+                if app_h is None:
+                    app_h = 0.0
+                else:
+                    app_h = float(app_h)
+                approach_z = (
+                    float(grasp_z_tip) + app_h
+                    if grasp_z_tip is not None
+                    else None
+                )
+                LOG.info(
+                    "LARGE final approach tipZ=%.4f (%s) app_hover=%.3f → approachZ=%.4f",
+                    float(grasp_z_tip) if grasp_z_tip is not None else float("nan"),
+                    z_src,
+                    app_h,
+                    float(approach_z) if approach_z is not None else float("nan"),
+                )
                 large_plan = plan_large_board_grasp(
                     coarse,
                     tool_y_m=float(self.cfg.large_tool_y_m),
@@ -2603,13 +3109,31 @@ class GraspPipeline:
                         getattr(self.cfg, "large_orient_rz_offset_deg", 0.0) or 0.0
                     ),
                     approach_dx_m=float(
-                        getattr(self.cfg, "large_approach_dx_m", 0.16) or 0.16
+                        getattr(self.cfg, "large_approach_dx_m", 0.15) or 0.15
                     ),
                     approach_dy_m=float(
-                        getattr(self.cfg, "large_approach_dy_m", 0.25) or 0.25
+                        getattr(self.cfg, "large_approach_dy_m", 0.08) or 0.08
                     ),
+                    approach_z_m=approach_z,
                 )
                 self._last_large_plan = large_plan
+                _announce_targets(
+                    "精定位完成 · 夹取目标",
+                    [
+                        ("左接近", large_plan.left_approach),
+                        ("右接近", large_plan.right_approach),
+                        ("左夹取", large_plan.left_grasp),
+                        ("右夹取", large_plan.right_grasp),
+                    ],
+                )
+                result.debug = {
+                    **(result.debug or {}),
+                    "left_approach": list(large_plan.left_approach),
+                    "right_approach": list(large_plan.right_approach),
+                    "left_grasp": list(large_plan.left_grasp),
+                    "right_grasp": list(large_plan.right_grasp),
+                }
+                _progress("fine")
                 if head_det is not None:
                     base_vis = (
                         self._last_head_pose_vis
@@ -2621,8 +3145,8 @@ class GraspPipeline:
                         head_det.corners,
                         title=(
                             f"grasp_mode=large ID={coarse.board_id} "
-                            f"mid23 dx={large_plan.approach_dx_m:.2f} "
-                            f"dy=±{large_plan.approach_dy_m:.2f}"
+                            f"tip P3/P2 +dx={large_plan.approach_dx_m:.2f} "
+                            f"±dy={large_plan.approach_dy_m:.2f}"
                         ),
                         plan=large_plan,
                     )
@@ -2713,6 +3237,7 @@ class GraspPipeline:
                             },
                         )
                     result.debug = {
+                        **(result.debug or {}),
                         "grasp_mode": grasp_mode,
                         "stage": "plan_only",
                         "live": True,
@@ -2764,7 +3289,7 @@ class GraspPipeline:
                     )
                     LOG.info("当前左臂: %s", cli["current_left"])
                     LOG.info("当前右臂: %s", cli["current_right"])
-                    _progress("coarse")
+                    _progress("fine")
                     return result
                 dual = self._ensure_dual()
                 # 先只到接近位：同 tip 高度，左/右相对 tip 各外开 open_margin（默认 5cm）
@@ -2785,13 +3310,11 @@ class GraspPipeline:
                 try:
                     pl, pr = dual.get_flange_poses()
                     def _remain_mm(cur, goal) -> float:
-                        return float(
-                            math.hypot(
-                                float(cur[0]) - float(goal[0]),
-                                float(cur[1]) - float(goal[1]),
-                            )
-                            * 1000.0
-                        )
+                        # 含 Z：此前只看 XY，会导致 tipZ=681 差 3~4cm 仍当到位
+                        dx = float(cur[0]) - float(goal[0])
+                        dy = float(cur[1]) - float(goal[1])
+                        dz = float(cur[2]) - float(goal[2])
+                        return float(math.sqrt(dx * dx + dy * dy + dz * dz) * 1000.0)
 
                     def _dist_center_mm(pose, center_xy) -> float:
                         return float(
@@ -2922,6 +3445,7 @@ class GraspPipeline:
                             },
                         )
                     result.debug = {
+                        **(result.debug or {}),
                         "grasp_mode": grasp_mode,
                         "stage": "approach_inward_done",
                         "live": True,
@@ -2936,6 +3460,9 @@ class GraspPipeline:
                 hover = self.flange_above_camera_down(coarse, current_flange=ee0)
             result.coarse_flange = list(hover)
             result.hover_flange = list(hover)
+            if grasp_mode != "large":
+                _announce_targets("粗定位完成 · 悬停目标", [("左臂", hover)])
+                _progress("coarse")
                 # 粗定位板心 → 头图
             self._overlay_grasp_on_head(
                     [

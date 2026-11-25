@@ -1,13 +1,13 @@
 {
-  "grasp_z_m": 0.73804,
+  "grasp_z_m": null,
   "unit": "m",
   "frame": "base_link · arm_l_linkTCP (=夹爪 tip)",
-  "note": "大板固定板面/夹取 tip 高度；相对 2026-11-16 示教 0.74304 再降 5mm",
+  "note": "已弃用标定高度：大板板面 Z 用头 FFS 角点；粗到位 Z=角点Z+0.35；腕精固定 cam 深 0.35m",
   "meta": {
-    "xyz_mm": [607.94, 232.22, 738.04],
-    "source": "left TCP live 2026-11-16T15:12+08 then -5mm",
+    "source": "deprecated_calib_use_head_ffs_2026-11-23",
     "tcp": "gripper_tip",
     "use_left_current_z": false,
-    "prev_grasp_z_m": 0.74304
+    "use_fixed_grasp_z_plane": false,
+    "fine_hover_height_m": 0.35
   }
 }

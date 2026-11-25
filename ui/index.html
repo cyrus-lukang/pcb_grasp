@@ -53,7 +53,7 @@
 <body>
   <main>
     <h1>pcb_grasp 抓取控制台</h1>
-    <p class="lead">选类别后「只定位」或「全流程」。大板双臂：头粗 → 左右腕精 → 接近后可内收。大板单臂：无头，腕粗 → 左精 P2/P3 → 停 mid23。</p>
+    <p class="lead">大板双臂：头FFS深度反投影角点XY → 粗到位=该XY / Z=角点Z+15cm（末端朝下）拍腕 → 腕精用当前相机到 grasp_z 深度得精XY → tip=精XY+dx/±dy、tipZ=grasp_z。复位=本轮作业起点。</p>
 
     <div id="camera-banner" class="banner connecting">正在连接相机…</div>
     <div id="robot-banner" class="banner err">机械臂未连接（只定位可不连）</div>
@@ -103,6 +103,7 @@
         <button id="connect-robot" type="button">连接机械臂</button>
         <button id="plan" type="button">只定位</button>
         <button id="run" type="button">全流程</button>
+        <button id="session-home" type="button">复位</button>
         <button id="inward" type="button">内收 5mm</button>
         <button id="inward-end" type="button">结束内收</button>
         <button id="reload" type="button">重载配置</button>
@@ -263,8 +264,8 @@
       const mode = result.grasp_mode || "?";
       const cli = result.cli || {};
       if (mode === "large") {
-        const la = result.left_approach_xyzrpy_mm_deg || flangeToMmDeg(result.left_approach);
-        const ra = result.right_approach_xyzrpy_mm_deg || flangeToMmDeg(result.right_approach);
+        const cL = result.coarse_left_xyzrpy_mm_deg || flangeToMmDeg(result.coarse_left);
+        const cR = result.coarse_right_xyzrpy_mm_deg || flangeToMmDeg(result.coarse_right);
         const lg = result.left_grasp_xyzrpy_mm_deg || flangeToMmDeg(result.left_grasp);
         const rg = result.right_grasp_xyzrpy_mm_deg || flangeToMmDeg(result.right_grasp);
         const curL = result.current_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange);
@@ -276,11 +277,11 @@
           cli.current_left || cliLine("left", curL),
           cli.current_right || cliLine("right", curR),
           ``,
-          `# 接近`,
-          cli.left_approach || cliLine("left", la),
-          cli.right_approach || cliLine("right", ra),
+          `# 接近（粗定位）`,
+          cliLine("left", cL),
+          cliLine("right", cR),
           ``,
-          `# tip`,
+          `# tip（精定位）`,
           cli.left_grasp || cliLine("left", lg),
           cli.right_grasp || cliLine("right", rg),
         ].join("\n");
@@ -484,6 +485,24 @@
           `cls 小板=${c.classes.pcb_small} nopcb=${c.classes.nopcb} 大板=${c.classes.pcb_large}；` +
           `grasp_z=${c.grasp_z_m ?? "未示教"}；robot_ip=${c.robot_ip}`;
         setStatus("配置已重载", "ok");
+      } catch (e) { setStatus(e.message, "err"); }
+    };
+    document.getElementById("session-home").onclick = async () => {
+      try {
+        if (!robotConnected) {
+          setStatus("请先「连接机械臂」", "err");
+          return;
+        }
+        setStatus("复位到作业起点…", "run");
+        const data = await post("/api/session_home", { action: "go" });
+        setStatus(data.message || "已复位", data.ok === false ? "err" : "ok");
+        confirmBanner.classList.remove("show");
+        awaitingConfirm = false;
+        showPlanImage = false;
+        out.textContent = "—";
+        if (planXy) planXy.textContent = "—";
+        if (poseXy) poseXy.textContent = "点「只定位」或「全流程」后打印…";
+        refreshPreview();
       } catch (e) { setStatus(e.message, "err"); }
     };
     document.getElementById("estop").onclick = async () => {

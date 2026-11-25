@@ -63,7 +63,7 @@ def main() -> int:
     parser.add_argument("--target", default="10.3.8.7:50066")
     parser.add_argument(
         "--color",
-        default="0,1,13",
+        default="1,3,6,7",
         help="comma-separated color cam_ids",
     )
     parser.add_argument(

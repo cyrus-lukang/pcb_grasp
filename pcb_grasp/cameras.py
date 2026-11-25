@@ -163,7 +163,7 @@ class HeadFisheyeCam:
 
 
 class HeadPortalCam:
-    """头双目：从 rim frame_bundle 取流（cam0/1）。
+    """头双目：从 rim frame_bundle 取流（cam6/7）。
 
     历史名 portal：8787 watch WS 已不再推 ``sample``，实际走 ``rim_frame_bundle``
     （默认 10.3.8.7:50066）。可传入共享 ``cache``，与腕摄共用一条连接。
@@ -173,8 +173,8 @@ class HeadPortalCam:
         self,
         portal: str = "10.3.8.7:50066",
         *,
-        left_cam_id: int = 0,
-        right_cam_id: int = 1,
+        left_cam_id: int = 7,
+        right_cam_id: int = 6,
         max_hz: float = 8.0,
         timeout_s: float = 60.0,
         cache=None,
@@ -280,8 +280,8 @@ def open_head_camera(cfg) -> HeadFisheyeCam | HeadPortalCam:
         return HeadPortalCam(
             getattr(cfg, "rim_frame_bundle", None)
             or getattr(cfg, "cam_portal", "10.3.8.7:50066"),
-            left_cam_id=int(getattr(cfg, "cam_portal_head_left_id", 0)),
-            right_cam_id=int(getattr(cfg, "cam_portal_head_right_id", 1)),
+            left_cam_id=int(getattr(cfg, "cam_portal_head_left_id", 7)),
+            right_cam_id=int(getattr(cfg, "cam_portal_head_right_id", 6)),
             max_hz=float(getattr(cfg, "cam_portal_max_hz", 15.0)),
             timeout_s=float(getattr(cfg, "cam_portal_timeout_s", 5.0)),
         )
@@ -295,7 +295,7 @@ def open_head_camera(cfg) -> HeadFisheyeCam | HeadPortalCam:
 
 
 def open_portal_head_and_wrist(cfg) -> tuple[HeadPortalCam, "WristPortalCam"]:
-    """头+腕共用一条 frame_bundle 连接（cams 0/1/13 + depth 12）。"""
+    """头+腕共用一条 frame_bundle 连接（头左=7 / 右=6，左腕彩色 1 / 深度 0）。"""
     from .bundle_cache import BundleFrameCache, DEFAULT_BUNDLE
 
     target = str(
@@ -305,12 +305,12 @@ def open_portal_head_and_wrist(cfg) -> tuple[HeadPortalCam, "WristPortalCam"]:
     ).strip()
     if ":8787" in target or target.endswith("8787"):
         target = DEFAULT_BUNDLE
-    left_id = int(getattr(cfg, "cam_portal_head_left_id", 0))
-    right_id = int(getattr(cfg, "cam_portal_head_right_id", 1))
-    wrist_id = int(getattr(cfg, "cam_portal_wrist_id", 13))
+    left_id = int(getattr(cfg, "cam_portal_head_left_id", 7))
+    right_id = int(getattr(cfg, "cam_portal_head_right_id", 6))
+    wrist_id = int(getattr(cfg, "cam_portal_wrist_id", 1))
     max_hz = float(getattr(cfg, "cam_portal_max_hz", 8.0))
     timeout_s = float(getattr(cfg, "cam_portal_timeout_s", 60.0))
-    depth_of_color = {13: 12, 15: 14}
+    depth_of_color = {1: 0, 3: 2}
     wrist_depth = getattr(cfg, "cam_portal_wrist_depth_id", None)
     if wrist_depth is not None:
         depth_of_color[int(wrist_id)] = int(wrist_depth)
@@ -371,9 +371,9 @@ def open_portal_head_and_wrist(cfg) -> tuple[HeadPortalCam, "WristPortalCam"]:
 
 
 class WristPortalCam:
-    """腕部 Gemini 305：frame_bundle 取流（cam13 左 / cam15 右），彩色 + 深度。
+    """腕部 Gemini 305：frame_bundle 取流（cam1 左 / cam3 右），彩色 + 深度。
 
-    深度在 bundle 里是 cam12/14，缓存会映射回彩色 cam_id。
+    深度在 bundle 里是 cam0/2，缓存会映射回彩色 cam_id。
     305 畸变很大（BROWN_CONRADY_K6）；默认按配置内参去畸变后再给检测/匹配。
     """
 
@@ -381,7 +381,7 @@ class WristPortalCam:
         self,
         portal: str = "10.3.8.7:50066",
         *,
-        cam_id: int = 13,
+        cam_id: int = 1,
         max_hz: float = 8.0,
         timeout_s: float = 60.0,
         need_depth: bool = True,
@@ -410,7 +410,7 @@ class WristPortalCam:
         self.need_depth = bool(need_depth)
         self.undistort = bool(undistort)
         self._own_cache = bool(own_cache)
-        depth_of_color = {13: 12, 15: 14}
+        depth_of_color = {1: 0, 3: 2}
         if depth_cam_id is not None:
             depth_of_color[self.cam_id] = int(depth_cam_id)
         if cache is not None:
@@ -643,7 +643,7 @@ def open_wrist_camera(cfg):
         return WristPortalCam(
             getattr(cfg, "rim_frame_bundle", None)
             or getattr(cfg, "cam_portal", "10.3.8.7:50066"),
-            cam_id=int(getattr(cfg, "cam_portal_wrist_id", 13)),
+            cam_id=int(getattr(cfg, "cam_portal_wrist_id", 1)),
             max_hz=float(getattr(cfg, "cam_portal_max_hz", 8.0)),
             timeout_s=float(getattr(cfg, "cam_portal_timeout_s", 60.0)),
             need_depth=bool(getattr(cfg, "cam_wrist_need_depth", True)),

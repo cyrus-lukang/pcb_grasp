@@ -98,6 +98,22 @@ def pixel_to_base_on_plane(
     return t + s * rd
 
 
+def cam_depth_to_plane_m(T_base_cam: np.ndarray, z_plane_m: float) -> float:
+    """相机光轴打到水平面 Z=z_plane 的深度（米）。由当前光心位置算出。"""
+    T = np.asarray(T_base_cam, dtype=np.float64).reshape(4, 4)
+    origin_z = float(T[2, 3])
+    axis_z = float(T[2, 2])
+    if abs(axis_z) < 1e-6:
+        raise RuntimeError("camera optical axis parallel to grasp plane")
+    depth = (float(z_plane_m) - origin_z) / axis_z
+    if depth <= 0.05:
+        raise RuntimeError(
+            f"camera depth to z={z_plane_m:.3f} invalid: {depth:.3f} "
+            f"(camZ={origin_z:.3f})"
+        )
+    return float(depth)
+
+
 def sample_depth_m(
     depth: np.ndarray,
     u: float,
@@ -133,6 +149,30 @@ def sample_depth_m(
     return vals[len(vals) // 2]
 
 
+def corner_uv_to_base(
+    u: float,
+    v: float,
+    *,
+    T_base_cam: np.ndarray,
+    K: Intrinsics,
+    fixed_depth_cam_m: float | None = None,
+    tray_z_m: float | None = None,
+) -> list[float]:
+    """单像素角点 → 基座 XYZ（大板腕精：V2·220e76 单角模型）。"""
+    if tray_z_m is not None:
+        return pixel_to_base_on_plane(
+            float(u),
+            float(v),
+            K=K,
+            T_base_cam=T_base_cam,
+            z_plane_m=float(tray_z_m),
+        ).tolist()
+    if fixed_depth_cam_m is None:
+        raise ValueError("Need tray_z_m or fixed_depth_cam_m")
+    p_cam = pixel_to_cam(float(u), float(v), float(fixed_depth_cam_m), K)
+    return transform_point(T_base_cam, p_cam).tolist()
+
+
 def corners_to_object_pose(
     det: PcbDetection,
     *,
@@ -144,11 +184,14 @@ def corners_to_object_pose(
     kp_i: int = 0,
     kp_j: int = 1,
 ) -> ObjectPose:
-    """Lift 4 corners to base and compute center + flange rz from corner kp_i→kp_j.
+    """Lift corners to base and compute center + flange rz from corner kp_i→kp_j.
 
     优先 ``tray_z_m``（水平托盘平面求交，抗倾斜头目 + 散斑飞点）；
-    否则用每角深度 / 固定相机深度。
+    否则用每角深度 / 固定相机深度。支持 1 角（单角模型）或 4 角。
     """
+    n = len(det.corners)
+    if n < 1:
+        raise ValueError("det.corners empty")
     if tray_z_m is not None:
         corners_base = [
             pixel_to_base_on_plane(
@@ -160,7 +203,7 @@ def corners_to_object_pose(
         if depth_m_per_corner is None:
             if fixed_depth_cam_m is None:
                 raise ValueError("Need tray_z_m, depth_m_per_corner, or fixed_depth_cam_m")
-            depth_m_per_corner = [fixed_depth_cam_m] * 4
+            depth_m_per_corner = [fixed_depth_cam_m] * n
 
         corners_cam = [
             pixel_to_cam(u, v, float(z), K)
@@ -169,10 +212,16 @@ def corners_to_object_pose(
         corners_base = [transform_point(T_base_cam, p).tolist() for p in corners_cam]
     center = np.mean(np.asarray(corners_base, dtype=np.float64), axis=0)
 
-    pa = corners_base[kp_i]
-    pb = corners_base[kp_j]
-    rz = base_y_angle_to_gripper_rz(pa, pb)
-    edge = rz_from_line_xy(pa, pb)
+    i0 = int(kp_i) if 0 <= int(kp_i) < n else 0
+    i1 = int(kp_j) if 0 <= int(kp_j) < n else min(1, n - 1)
+    pa = corners_base[i0]
+    pb = corners_base[i1]
+    if i0 == i1:
+        rz = 0.0
+        edge = 0.0
+    else:
+        rz = base_y_angle_to_gripper_rz(pa, pb)
+        edge = rz_from_line_xy(pa, pb)
 
     return ObjectPose(
         x=float(center[0]),
@@ -196,6 +245,9 @@ def head_localize(
     tray_z_m: float | None = None,
     kp_i: int = 0,
     kp_j: int = 1,
+    depth_m_per_corner: Sequence[float] | None = None,
+    corner_z_max: float = 1.0,
+    required_corner_indices: Sequence[int] | None = None,
 ) -> ObjectPose:
     # 托盘平面优先：头目倾斜时固定相机深度会把近/远板 Z·XY 一起拉歪
     if tray_z_m is not None:
@@ -217,36 +269,47 @@ def head_localize(
         return pose
 
     depths: list[float] | None = None
-    if depth is not None:
-        depths = []
-        for u, v in det.corners:
-            z = sample_depth_m(depth, u, v, depth_scale=depth_scale)
-            if z is None:
-                if fixed_depth_cam_m is None:
-                    raise RuntimeError(f"No depth at head corner ({u:.1f},{v:.1f})")
-                z = fixed_depth_cam_m
-            depths.append(z)
-        # 角点落孔洞/散斑飞点时四角会一起偏；中位数救不了系统偏差。
-        # 有托盘标定深度时：中值偏离 >8cm → 整板改用固定深度；否则逐角钳到 ±8cm。
-        med = float(sorted(depths)[len(depths) // 2])
-        if fixed_depth_cam_m is not None:
-            ref = float(fixed_depth_cam_m)
-            if abs(med - ref) > 0.08:
-                LOG.warning(
-                    "head corner depth med=%.3fm vs fixed=%.3fm → use fixed for all corners",
-                    med,
-                    ref,
-                )
-                depths = [ref] * len(depths)
-            else:
-                depths = [z if abs(z - ref) <= 0.08 else ref for z in depths]
-        else:
-            depths = [z if abs(z - med) <= 0.08 else med for z in depths]
-        LOG.info(
-            "head corner depths raw_med=%.3f used=%s",
-            med,
-            [round(z, 3) for z in depths],
+    if depth_m_per_corner is not None:
+        depths = [float(z) for z in depth_m_per_corner]
+        LOG.info("head corner depths (per-corner frame median)=%s", [round(z, 3) for z in depths])
+    elif depth is not None:
+        # 只留 1m 以内：更远是打到地面/背景，不用。四个角互不替换。
+        # required_corner_indices 之外的角（大板的 P0/P1）没有合格深度也不丢帧。
+        n_c = len(det.corners)
+        required = (
+            set(range(n_c))
+            if required_corner_indices is None
+            else {int(i) for i in required_corner_indices}
         )
+        raw: list[float | None] = []
+        for u, v in det.corners:
+            raw.append(
+                sample_depth_m(
+                    depth, u, v, depth_scale=depth_scale, z_max=float(corner_z_max)
+                )
+            )
+        need = [raw[i] for i in range(n_c) if i in required]
+        if any(z is None for z in need):
+            missing = [
+                i
+                for i in range(n_c)
+                if i in required and raw[i] is None
+            ]
+            uv = det.corners[missing[0]]
+            raise RuntimeError(
+                f"No depth <{corner_z_max:.2f}m at head corner P{missing[0]} "
+                f"({uv[0]:.1f},{uv[1]:.1f})"
+            )
+        fill = float(sorted(float(z) for z in need)[len(need) // 2])
+        skipped = [i for i in range(n_c) if i not in required and raw[i] is None]
+        depths = [fill if z is None else float(z) for z in raw]
+        if skipped:
+            LOG.info(
+                "head skip depth on P%s (not required); fill=%.3f",
+                skipped,
+                fill,
+            )
+        LOG.info("head corner depths=%s", [round(z, 3) for z in depths])
     return corners_to_object_pose(
         det,
         T_base_cam=T_base_cam,
