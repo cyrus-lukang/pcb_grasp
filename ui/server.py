@@ -72,9 +72,12 @@ _dual = None
 _motion = None
 _head_cam = None
 _wrist_cam = None
+_right_wrist_cam = None  # 右腕 cam3（大板单臂实时预览 / 作业共用）
 _preview_pipe = None
 _preview_jpeg: bytes = b""
 _wrist_preview_jpeg: bytes = b""
+_wrist_coarse_jpeg: bytes = b""  # 最近一帧粗定位叠图（不阻断实时）
+_wrist_fine_jpeg: bytes = b""  # 最近一帧精定位叠图
 _preview_meta: dict = {"ok": False, "error": "", "ts": 0.0, "n_det": 0}
 _confirm_jpeg: bytes = b""
 _confirm_event = threading.Event()
@@ -86,6 +89,7 @@ _cam_lock = threading.Lock()
 # 本轮作业开始时的左右臂法兰位姿（复位用）
 _session_home_left: list[float] | None = None
 _session_home_right: list[float] | None = None
+_ui_force_class: str | None = None  # 网页当前流程（影响预览走哪路相机）
 
 
 def _record_session_home() -> dict:
@@ -237,6 +241,19 @@ def _encode_jpeg(bgr, *, max_w: int = 1280, quality: int = 80) -> bytes:
     return buf.tobytes()
 
 
+# 实时预览短缓存：大板单臂左右两格同时刷时共用一帧，避免 2×grab+2×YOLO
+_live_wrist_cache: dict = {
+    "bgr": None,
+    "t": 0.0,
+    "jpeg_plain": b"",
+    "jpeg_coarse": b"",
+    "jpeg_fine": b"",
+    "det_t": 0.0,
+}
+_LIVE_GRAB_TTL_S = 0.12
+_LIVE_DET_TTL_S = 2.0
+
+
 def _close_motion() -> None:
     global _dual, _motion
     if _dual is not None:
@@ -256,7 +273,13 @@ def _close_motion() -> None:
 
 
 def _close_cams() -> None:
-    global _head_cam, _wrist_cam, _preview_pipe
+    global _head_cam, _wrist_cam, _right_wrist_cam, _preview_pipe
+    if _right_wrist_cam is not None:
+        try:
+            _right_wrist_cam.close()
+        except Exception:
+            pass
+        _right_wrist_cam = None
     if _wrist_cam is not None:
         try:
             _wrist_cam.close()
@@ -299,6 +322,64 @@ def _ensure_wrist_cam():
     return _wrist_cam
 
 
+def _ensure_right_wrist_cam():
+    """右腕 cam3 + 深度 cam2（大板单臂）。"""
+    global _right_wrist_cam
+    if _right_wrist_cam is None:
+        from pcb_grasp.cameras import WristPortalCam
+
+        portal = (
+            getattr(_cfg, "rim_frame_bundle", None)
+            or getattr(_cfg, "cam_portal", "10.3.8.7:50066")
+        )
+        dist = (
+            getattr(_cfg, "wrist_dist_coeffs_right", None)
+            or getattr(_cfg, "wrist_dist_coeffs", None)
+        )
+        cam_id = int(
+            getattr(_cfg, "large_single_cam_id", None)
+            or getattr(_cfg, "cam_portal_wrist_right_id", 3)
+            or 3
+        )
+        depth_id = int(
+            getattr(_cfg, "large_single_depth_cam_id", None)
+            or getattr(_cfg, "cam_portal_wrist_right_depth_id", 2)
+            or 2
+        )
+        fx = float(
+            getattr(_cfg, "wrist_fx_right", None)
+            or getattr(_cfg, "wrist_fx", 615.0)
+        )
+        fy = float(
+            getattr(_cfg, "wrist_fy_right", None)
+            or getattr(_cfg, "wrist_fy", 615.0)
+        )
+        cx = float(
+            getattr(_cfg, "wrist_cx_right", None)
+            or getattr(_cfg, "wrist_cx", 630.0)
+        )
+        cy = float(
+            getattr(_cfg, "wrist_cy_right", None)
+            or getattr(_cfg, "wrist_cy", 401.0)
+        )
+        LOG.info("opening right wrist cam%d depth=%d @ %s", cam_id, depth_id, portal)
+        _right_wrist_cam = WristPortalCam(
+            portal,
+            cam_id=cam_id,
+            max_hz=float(getattr(_cfg, "cam_portal_max_hz", 15.0)),
+            timeout_s=float(getattr(_cfg, "cam_portal_timeout_s", 60.0)),
+            need_depth=True,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            dist_coeffs=list(dist) if dist else None,
+            undistort=bool(getattr(_cfg, "cam_wrist_undistort", False)),
+            depth_cam_id=depth_id,
+        )
+    return _right_wrist_cam
+
+
 def _grab_head():
     return _ensure_head_cam().grab()
 
@@ -307,13 +388,50 @@ def _grab_wrist():
     return _ensure_wrist_cam().grab()
 
 
+def _grab_right_wrist(
+    *,
+    fresh: bool = False,
+    pre_seq: int | None = None,
+    ref_bgr=None,
+):
+    """取右腕帧。
+
+    - 带 ``pre_seq``/``ref_bgr``：动臂到位后全量 flush（清缓存+内容门）
+    - 仅 ``fresh=True``：等比上一帧更新的 seq（识别循环用，不再次清全缓存）
+    """
+    global _live_wrist_cache
+    cam = _ensure_right_wrist_cam()
+    need_flush = (pre_seq is not None) or (ref_bgr is not None)
+    if need_flush and hasattr(cam, "flush_and_grab"):
+        _live_wrist_cache["bgr"] = None
+        _live_wrist_cache["t"] = 0.0
+        _live_wrist_cache["jpeg_plain"] = b""
+        return cam.flush_and_grab(
+            n_drop=5,
+            pre_seq=pre_seq,
+            ref_bgr=ref_bgr,
+            max_corr=0.90,
+            content_wait_s=3.0,
+        )
+    try:
+        return cam.grab(fresh=bool(fresh))
+    except TypeError:
+        return cam.grab()
+
+
 def _connect_camera() -> dict:
     """Open head (required) and wrist (optional). Independent of robot."""
-    global _head_cam, _wrist_cam
+    global _head_cam, _wrist_cam, _right_wrist_cam
     _set_camera(connecting=True, connected=False, error="", mode="")
     try:
         with _cam_lock:
             # 先关掉旧 watch，避免 portal「too many watches」
+            if _right_wrist_cam is not None:
+                try:
+                    _right_wrist_cam.close()
+                except Exception:
+                    pass
+                _right_wrist_cam = None
             if _wrist_cam is not None:
                 try:
                     _wrist_cam.close()
@@ -365,11 +483,22 @@ def _connect_camera() -> dict:
                 except Exception as exc:
                     LOG.warning("wrist camera skipped: %s", exc)
                 _ = head
+            try:
+                _ensure_right_wrist_cam()
+                mode = mode + "+cam3"
+            except Exception as exc:
+                LOG.warning("right wrist cam3 skipped: %s", exc)
         _set_camera(connecting=False, connected=True, error="", mode=mode)
         LOG.info("camera connected mode=%s", mode)
     except Exception as exc:
         LOG.warning("camera connect failed: %s", exc)
         with _cam_lock:
+            try:
+                if _right_wrist_cam is not None:
+                    _right_wrist_cam.close()
+            except Exception:
+                pass
+            _right_wrist_cam = None
             try:
                 if _wrist_cam is not None:
                     _wrist_cam.close()
@@ -474,6 +603,149 @@ def _grab_preview(*, detect: bool = True) -> tuple[bytes, dict]:
             _preview_jpeg = jpeg
             _preview_meta = dict(meta)
         return jpeg, meta
+
+
+def _grab_right_wrist_role_preview(
+    role: str = "fine",
+    *,
+    detect: bool = False,
+) -> tuple[bytes, dict]:
+    """右腕 cam3 实时预览（对齐 capture_camera_subscribe：流畅出图）。
+
+    默认 **不跑 YOLO**（网页 live 卡多半是每 0.9s 粗+精各检一次）。
+    ``detect=True`` 时最多每 ``_LIVE_DET_TTL_S`` 检一次并缓存叠图。
+    出图缩到边长 640，与采集页预览同量级。
+    """
+    global _wrist_coarse_jpeg, _wrist_fine_jpeg
+    import cv2
+    from pcb_grasp.detect import draw_pose_vis
+
+    if not _camera_snapshot().get("connected"):
+        raise RuntimeError("相机未连接，请先点「连接相机」")
+
+    role_l = str(role or "fine").strip().lower()
+    is_coarse = role_l in ("coarse", "c", "rough", "large")
+    title = "RIGHT cam3 COARSE (live)" if is_coarse else "RIGHT cam3 FINE (live)"
+    now = time.monotonic()
+
+    # 短缓存：粗/精两路同时刷只 grab 一次
+    bgr = None
+    if (
+        _live_wrist_cache["bgr"] is not None
+        and (now - float(_live_wrist_cache["t"])) < _LIVE_GRAB_TTL_S
+    ):
+        bgr = _live_wrist_cache["bgr"]
+    if bgr is None:
+        with _cam_lock:
+            _ensure_preview_pipe()
+            bgr, _dep = _grab_right_wrist()
+        _live_wrist_cache["bgr"] = bgr
+        _live_wrist_cache["t"] = now
+        # 新帧：清纯净预览缓存
+        _live_wrist_cache["jpeg_plain"] = b""
+
+    n_det = 0
+    vis = bgr
+    if detect:
+        need_det = (now - float(_live_wrist_cache["det_t"])) >= _LIVE_DET_TTL_S
+        cache_key = "jpeg_coarse" if is_coarse else "jpeg_fine"
+        if not need_det and _live_wrist_cache.get(cache_key):
+            jpeg = _live_wrist_cache[cache_key]
+            meta = {
+                "ok": True,
+                "error": "",
+                "ts": time.time(),
+                "n_det": -1,
+                "role": "coarse" if is_coarse else "fine",
+                "cam": "right3",
+                "cached_det": True,
+            }
+            return jpeg, meta
+        try:
+            pipe = _ensure_preview_pipe()
+            if is_coarse:
+                det = pipe._ensure_large_single_coarse_det()  # noqa: SLF001
+            else:
+                det = pipe._ensure_large_single_fine_det()  # noqa: SLF001
+            if det is not None:
+                dets = det.detect(bgr) or []
+                n_det = len(dets)
+                if dets:
+                    best = max(
+                        dets,
+                        key=lambda d: float(getattr(d, "conf", 0) or 0),
+                    )
+                    kdir = (
+                        (2, 3)
+                        if is_coarse and len(best.corners or []) >= 4
+                        else (0, 0)
+                    )
+                    vis = draw_pose_vis(
+                        bgr,
+                        best,
+                        title=f"{title} ×{n_det}",
+                        kpt_dir=kdir,
+                    )
+                else:
+                    vis = bgr.copy()
+                    cv2.putText(
+                        vis,
+                        f"{title} (no det)",
+                        (8, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 200, 255),
+                        2,
+                    )
+            _live_wrist_cache["det_t"] = now
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("right wrist %s preview detect: %s", role_l, exc)
+            vis = bgr.copy()
+            cv2.putText(
+                vis,
+                f"{title} (detect err)",
+                (8, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
+        jpeg = _encode_jpeg(vis, max_w=640, quality=70)
+        _live_wrist_cache[cache_key] = jpeg
+    else:
+        if _live_wrist_cache["jpeg_plain"] and (
+            now - float(_live_wrist_cache["t"])
+        ) < _LIVE_GRAB_TTL_S:
+            jpeg = _live_wrist_cache["jpeg_plain"]
+        else:
+            vis = bgr.copy()
+            cv2.putText(
+                vis,
+                f"{title} (live)",
+                (8, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            jpeg = _encode_jpeg(vis, max_w=640, quality=70)
+            _live_wrist_cache["jpeg_plain"] = jpeg
+
+    meta = {
+        "ok": True,
+        "error": "",
+        "ts": time.time(),
+        "n_det": n_det,
+        "role": "coarse" if is_coarse else "fine",
+        "cam": "right3",
+        "detect": bool(detect),
+    }
+    with _lock:
+        if is_coarse:
+            _wrist_coarse_jpeg = jpeg
+        else:
+            _wrist_fine_jpeg = jpeg
+    return jpeg, meta
 
 
 def _robot_endpoint_label(cfg) -> str:
@@ -603,6 +875,8 @@ def _result_payload(result, batch_dir: Path) -> dict:
     coarse_right = dbg.get("coarse_right")
     left_grasp = dbg.get("left_grasp")
     right_grasp = dbg.get("right_grasp")
+    arrive_p2 = dbg.get("arrive_p2_flange")
+    arrive_p3 = dbg.get("arrive_p3_flange")
     return {
         "ok": bool(result.ok),
         "message": result.message,
@@ -613,10 +887,14 @@ def _result_payload(result, batch_dir: Path) -> dict:
         "current_flange_right": cur_r,
         "hover_flange": result.hover_flange,
         "fine_flange": result.fine_flange,
+        "arrive_p2_flange": arrive_p2,
+        "arrive_p3_flange": arrive_p3,
         "current_xyzrpy_mm_deg": _mm_deg(cur),
         "current_right_xyzrpy_mm_deg": _mm_deg(cur_r),
         "coarse_xyzrpy_mm_deg": _mm_deg(result.hover_flange),
         "fine_xyzrpy_mm_deg": _mm_deg(result.fine_flange),
+        "arrive_p2_xyzrpy_mm_deg": _mm_deg(arrive_p2),
+        "arrive_p3_xyzrpy_mm_deg": _mm_deg(arrive_p3),
         # 大板双臂末端（接近 / 合拢 tip）
         "coarse_left": coarse_left,
         "coarse_right": coarse_right,
@@ -634,8 +912,11 @@ def _result_payload(result, batch_dir: Path) -> dict:
             "current": cli.get("current"),
             "current_left": cli.get("current_left") or cli.get("current"),
             "current_right": cli.get("current_right"),
-            "coarse": cli.get("coarse"),
-            "fine": cli.get("fine"),
+            "arrive_p2": cli.get("arrive_p2"),
+            "arrive_p3": cli.get("arrive_p3"),
+            "coarse": cli.get("coarse") or cli.get("arrive_p2"),
+            "fine": cli.get("fine") or cli.get("stop"),
+            "stop": cli.get("stop") or cli.get("fine"),
             "arm": dbg.get("arm") or cli.get("arm"),
             "left_approach": cli.get("left_approach"),
             "right_approach": cli.get("right_approach"),
@@ -849,12 +1130,15 @@ def _do_inward_step() -> dict:
 
 def _run_job(opts: dict) -> None:
     global _job, _preview_jpeg, _confirm_jpeg, _wrist_preview_jpeg
+    global _wrist_coarse_jpeg, _wrist_fine_jpeg
     from pcb_grasp.pipeline import GraspPipeline
 
     batch_dir = next_batch_dir(Path(opts.get("vis") or (ROOT / "output" / "live_vis")))
     plan_only = bool(opts.get("plan_only"))
     with _lock:
         _wrist_preview_jpeg = b""
+        _wrist_coarse_jpeg = b""
+        _wrist_fine_jpeg = b""
         _job.update(
             {
                 "running": True,
@@ -868,6 +1152,8 @@ def _run_job(opts: dict) -> None:
                 "confirm_plan": None,
                 "confirm_board_id": None,
                 "has_wrist_vis": False,
+                "has_coarse_vis": False,
+                "has_fine_vis": False,
             }
         )
     dry_pair = None
@@ -916,18 +1202,15 @@ def _run_job(opts: dict) -> None:
         force = opts.get("force_class")
         if force in ("", "auto", None):
             force = None
+        global _ui_force_class
+        _ui_force_class = (
+            None if force is None else str(force).strip().lower() or None
+        )
         is_large_single = str(force or "") in (
             "large_single",
             "large-single",
             "single",
         )
-        pipe = GraspPipeline(
-            cfg=_cfg,
-            motion=motion,
-            dual_motion=dual,
-            force_class=force,
-        )
-
         # 真机抓取 / 识别抓取点 / 精定位 / 大板单臂：开腕部
         stage_opt = str(opts.get("stage") or "all")
         need_wrist = (
@@ -943,6 +1226,33 @@ def _run_job(opts: dict) -> None:
                 except Exception as exc:
                     LOG.warning("wrist open for grasp/plan: %s", exc)
 
+        # 大板单臂：右臂 + 常驻 cam3（与实时预览共用，作业结束不关）
+        single_grab = _grab_wrist
+        pipe_motion = motion
+        if is_large_single:
+            if dual is not None and getattr(dual, "right", None) is not None:
+                pipe_motion = dual.right
+                LOG.info("large_single: pipeline motion → dual.right")
+            try:
+                with _cam_lock:
+                    _ensure_right_wrist_cam()
+                single_grab = _grab_right_wrist
+                LOG.info("large_single: reuse persistent right wrist cam3")
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(
+                    "large_single: cam3 不可用，回退左腕 grab: %s", exc
+                )
+                single_grab = _grab_wrist
+
+        pipe = GraspPipeline(
+            cfg=_cfg,
+            motion=pipe_motion,
+            dual_motion=dual,
+            force_class=force,
+        )
+        if is_large_single and single_grab is _grab_right_wrist:
+            pipe._large_single_grab_is_right = True  # noqa: SLF001
+
         large_cb = None
         if (
             want_real
@@ -955,6 +1265,7 @@ def _run_job(opts: dict) -> None:
         def _on_progress(partial, phase: str) -> None:
             """粗/精定位一出就写进 job.result，并推头/腕识别图到网页。"""
             global _preview_jpeg, _wrist_preview_jpeg
+            global _wrist_coarse_jpeg, _wrist_fine_jpeg
             try:
                 payload = _result_payload(partial, batch_dir)
                 payload["ok"] = None  # 进行中
@@ -996,21 +1307,35 @@ def _run_job(opts: dict) -> None:
                         )
                 else:
                     msg = f"进度: {phase}"
-                # 头/腕识别图：粗（含大板单臂腕粗）与精都推；有图就写
-                if getattr(pipe, "_last_head_pose_vis", None) is not None:
-                    try:
-                        jpeg = _encode_jpeg(pipe._last_head_pose_vis)  # noqa: SLF001
+                # 推粗/精结果图（网页 snapshot=1 用；与 live 分流）
+                try:
+                    coarse_src = getattr(pipe, "_last_wrist_pose_vis", None)
+                    if phase == "coarse" and coarse_src is None:
+                        coarse_src = getattr(pipe, "_last_wrist_coarse_bgr", None)
+                    if phase == "coarse" and coarse_src is not None:
+                        jpeg = _encode_jpeg(coarse_src)
                         with _lock:
                             _preview_jpeg = jpeg
-                    except Exception:
-                        pass
-                if getattr(pipe, "_last_wrist_pose_vis", None) is not None:
-                    try:
+                            _wrist_coarse_jpeg = jpeg
+                    fine_src = getattr(
+                        pipe, "_last_wrist_fine_right_vis", None
+                    ) or getattr(pipe, "_last_wrist_fine_left_vis", None)
+                    if fine_src is None:
+                        fine_src = getattr(pipe, "_last_wrist_pose_vis", None)
+                    if phase in ("fine", "after_large_single_fine") and fine_src is not None:
+                        wjpeg = _encode_jpeg(fine_src)
+                        with _lock:
+                            _wrist_preview_jpeg = wjpeg
+                            _wrist_fine_jpeg = wjpeg
+                    elif phase == "fine" and getattr(
+                        pipe, "_last_wrist_pose_vis", None
+                    ) is not None:
                         wjpeg = _encode_jpeg(pipe._last_wrist_pose_vis)  # noqa: SLF001
                         with _lock:
                             _wrist_preview_jpeg = wjpeg
-                    except Exception:
-                        pass
+                            _wrist_fine_jpeg = wjpeg
+                except Exception:
+                    pass
                 payload["message"] = msg
                 with _lock:
                     _job.update(
@@ -1019,25 +1344,29 @@ def _run_job(opts: dict) -> None:
                             "message": msg,
                             "result": payload,
                             "batch_dir": str(batch_dir),
-                            "has_wrist_vis": bool(_wrist_preview_jpeg),
+                            "has_wrist_vis": True,
+                            "has_coarse_vis": bool(_wrist_coarse_jpeg),
+                            "has_fine_vis": bool(_wrist_fine_jpeg),
                         }
                     )
                 LOG.info("ui progress [%s] %s", phase, msg)
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("ui progress publish failed: %s", exc)
 
-        with _cam_lock:
-            result = pipe.run_live(
-                _grab_head,
-                _grab_wrist,
-                settle_s=float(opts.get("settle") or _cfg.live_settle_s),
-                do_grasp=bool(opts.get("do_grasp", True)) and want_real and not plan_only,
-                save_vis_dir=batch_dir,
-                stage=str(opts.get("stage") or "all"),
-                large_confirm=large_cb,
-                plan_only=plan_only,
-                on_progress=_on_progress,
-            )
+        # 不整段占 _cam_lock：作业期间网页仍可刷 cam3 实时粗/精预览
+        result = pipe.run_live(
+            _grab_head,
+            single_grab,
+            settle_s=float(opts.get("settle") or _cfg.live_settle_s),
+            do_grasp=bool(opts.get("do_grasp", True))
+            and want_real
+            and not plan_only,
+            save_vis_dir=batch_dir,
+            stage=str(opts.get("stage") or "all"),
+            large_confirm=large_cb,
+            plan_only=plan_only,
+            on_progress=_on_progress,
+        )
 
         if getattr(pipe, "_last_head_pose_vis", None) is not None:
             try:
@@ -1062,8 +1391,23 @@ def _run_job(opts: dict) -> None:
                 wjpeg = _encode_jpeg(pipe._last_wrist_pose_vis)  # noqa: SLF001
                 with _lock:
                     _wrist_preview_jpeg = wjpeg
+                    # 粗图叠点通常在 _last_wrist_pose_vis（mid/stop/P2/P3）
+                    if not _wrist_coarse_jpeg:
+                        _wrist_coarse_jpeg = wjpeg
             except Exception:
                 pass
+        # 精 P2/P3 单角叠图
+        try:
+            fine_vis = getattr(pipe, "_last_wrist_fine_right_vis", None) or getattr(
+                pipe, "_last_wrist_fine_left_vis", None
+            )
+            if fine_vis is not None:
+                fj = _encode_jpeg(fine_vis)
+                with _lock:
+                    _wrist_fine_jpeg = fj
+                    _wrist_preview_jpeg = fj
+        except Exception:
+            pass
 
         payload = _result_payload(result, batch_dir)
         try:
@@ -1083,6 +1427,11 @@ def _run_job(opts: dict) -> None:
                     "batch_dir": str(batch_dir),
                     "error": "" if payload["ok"] else payload["message"],
                     "awaiting_confirm": False,
+                    "has_wrist_vis": bool(
+                        _wrist_preview_jpeg or _wrist_fine_jpeg or _wrist_coarse_jpeg
+                    ),
+                    "has_coarse_vis": bool(_wrist_coarse_jpeg),
+                    "has_fine_vis": bool(_wrist_fine_jpeg),
                 }
             )
     except Exception as exc:
@@ -1196,12 +1545,68 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "camera": _camera_snapshot()})
             return
         if path == "/api/wrist.jpg":
+            qs = parsed.query or ""
+            # role=coarse|fine → 大板单臂：cam3 实时 / 或 snapshot 结果图
+            role = "fine"
+            for part in qs.split("&"):
+                if part.startswith("role="):
+                    role = part.split("=", 1)[1] or "fine"
+            want_snapshot = "snapshot=1" in qs or "result=1" in qs
+            if want_snapshot:
+                with _lock:
+                    jpeg = (
+                        _wrist_coarse_jpeg
+                        if str(role).lower().startswith("c")
+                        else (_wrist_fine_jpeg or _wrist_preview_jpeg)
+                    )
+                if jpeg:
+                    self._send_jpeg(jpeg)
+                    return
+                self._send(
+                    404,
+                    {"ok": False, "error": "暂无精/粗结果快照（等定位跑完）"},
+                )
+                return
+            want_live = (
+                "live=1" in qs
+                or "role=" in qs
+                or str(_ui_force_class or "") in ("large_single", "large-single", "single")
+            )
+            if want_live or "role=" in qs:
+                try:
+                    # 默认流畅预览；加 detect=1 才叠 YOLO（很卡）
+                    do_det = "detect=1" in qs
+                    jpeg, _meta = _grab_right_wrist_role_preview(
+                        role, detect=do_det
+                    )
+                    self._send_jpeg(jpeg)
+                    return
+                except Exception as exc:
+                    LOG.warning("wrist live(%s) preview failed: %s", role, exc)
+                    # 回退最近一帧粗/精快照
+                    with _lock:
+                        jpeg = (
+                            _wrist_coarse_jpeg
+                            if str(role).lower().startswith("c")
+                            else (_wrist_fine_jpeg or _wrist_preview_jpeg)
+                        )
+                    if jpeg:
+                        self._send_jpeg(jpeg)
+                        return
+                    self._send(
+                        404,
+                        {
+                            "ok": False,
+                            "error": f"腕部实时预览失败: {exc}",
+                        },
+                    )
+                    return
+            # 兼容旧路径：有结果图则返回；否则左腕实时
             with _lock:
-                jpeg = _wrist_preview_jpeg
+                jpeg = _wrist_fine_jpeg or _wrist_preview_jpeg
             if jpeg:
                 self._send_jpeg(jpeg)
                 return
-            # 尚无精定位结果图时：尝试拉左腕实时画面
             try:
                 import cv2
 
@@ -1230,6 +1635,41 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
         if path == "/api/head.jpg":
+            qs = parsed.query or ""
+            # 大板单臂：上头图位置改刷 cam3 粗定位实时流
+            force_single = (
+                "mode=large_single" in qs
+                or "role=coarse" in qs
+                or str(_ui_force_class or "") in ("large_single", "large-single", "single")
+            )
+            if force_single:
+                if "snapshot=1" in qs or "result=1" in qs:
+                    with _lock:
+                        jpeg = _wrist_coarse_jpeg or _preview_jpeg
+                    if jpeg:
+                        self._send_jpeg(jpeg)
+                        return
+                    self._send(
+                        404,
+                        {"ok": False, "error": "暂无粗定位结果快照"},
+                    )
+                    return
+                try:
+                    do_det = "detect=1" in qs
+                    jpeg, _meta = _grab_right_wrist_role_preview(
+                        "coarse", detect=do_det
+                    )
+                    self._send_jpeg(jpeg)
+                    return
+                except Exception as exc:
+                    LOG.warning("large_single head←cam3 coarse failed: %s", exc)
+                    with _lock:
+                        jpeg = _wrist_coarse_jpeg or _preview_jpeg
+                    if jpeg:
+                        self._send_jpeg(jpeg)
+                        return
+                    self._send(500, {"ok": False, "error": str(exc)})
+                    return
             job = _job_snapshot()
             if job.get("running") and not job.get("awaiting_confirm"):
                 with _lock:
@@ -1246,7 +1686,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_jpeg(jpeg)
                     return
             try:
-                qs = parsed.query or ""
                 detect = "nodetect" not in qs
                 jpeg, _meta = _grab_preview(detect=detect)
                 self._send_jpeg(jpeg)

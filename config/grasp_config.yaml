@@ -74,17 +74,43 @@ large_board:
   fine_hover_height_m: 0.15   # 拍腕 tipZ = grasp_z_m + 本值（左右统一）
   approach_hover_height_m: 0.0  # 精接近 tipZ = grasp_z_m（不再抬高）
   fine_match_max_dist_m: 0.15 # 腕精相对粗角点/板心匹配阈值
+  # 精拍到位后原地等识别：认到立刻去下一角/停位；超时才报未识别（期间不动臂）
+  fine_detect_wait_s: 10.0
+  # 大板外形（米）：P2P3 在长边；停 tip = 长方形几何中心
+  # center = mid(P2,P3) + (width_m/2) * n̂_板内（⊥P2→P3）
+  width_m: 0.27    # 垂直于 P2P3 的边 = 27 cm → 半宽 13.5 cm
+  length_m: 0.36   # P2P3 边 = 36 cm
 
-  # —— 单臂支路 B（无头；腕粗 → 左精 P2/P3 → 停 mid23）——
-  # 平台选 force=large_single 进入；位姿/高度占位，后面你写死
+  # —— 单臂支路 B（无头；右腕 cam3：腕粗 → 精 P2/P3 → 停 mid）——
+  # 平台选 force=large_single；右臂 · cam3/深度 cam2
+  # 粗：pcb-large-1·0ca8f6（4角，真实深度算 XY/Z）；※ grasp_z_m 不参与定位
+  # 精拍：相机光心在角点上方 25cm、光轴朝下；固定 cam 深 25cm
+  # 停位：板心 XY（由 width/length + P2/P3 算）· Z=角点+10cm · 末端朝下 rz∥P2P3
   single_arm:
     enable: true
-    # 粗定位前左臂固定法兰 [x,y,z,rx,ry,rz] 米/弧度；null=暂用当前 TCP
+    arm: right
+    cam_id: 3
+    depth_cam_id: 2
+    # T_base_cam：机上 arm_r_305g_frame（python -m rim_python.camera_pose），不乘 yaml 手眼
+    cam_pose_from_tf: true
+    coarse_pose_weights: /home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/models/yolopose/yolopose_pcb-large-1_20261124184448_0ca8f6/best.pt
+    coarse_imgsz: 480
+    coarse_n_corners: 4
+    fine_pose_weights: /home/ubuntu/workspace/lk_Perception/calibration/Perceptual_Processing_Platform/models/yolopose/yolopose_corner-1_20261124184050_90459c/best.pt
+    fine_imgsz: 480
+    fine_n_corners: 1
+    # 粗定位前固定法兰；null=当前 TCP 拍粗图
     coarse_flange_pose: null
-    # 精定位悬停高度（相对板面）；null=复用上面 fine_hover_height_m
-    fine_hover_height_m: null
-    # 精定位结束后停在 mid(P2,P3) 的相机 Z（基座）；null=后面写死（暂不强制落到固定高）
+    # 精拍到位：相机光心 Z = 角点Z + 本值（光轴朝下）
+    fine_hover_height_m: 0.30
+    # 精定位反投影：固定相机深度 = 同上 hover（光心到板）
+    fine_fixed_depth_m: 0.30
+    # 停 tip XY = 板心 = mid(P2,P3)+(width/2)*板内法向；勿再写固定 13cm
+    # stop_dy_m: null  # 调试覆盖才填；默认用 width_m/2
+    stop_z_above_board_m: 0.10
     stop_z_m: null
+    # 最终停位 rz = 按 P2→P3 算出的 rz + 本值（度）
+    stop_rz_offset_deg: 36.87
 
 calib:
   # 左图=portal cam7，用 CAM0 校正。右图=portal cam6，用 CAM1 校正。视差方向因此反过来，不再水平翻转。
@@ -115,7 +141,7 @@ calib:
     - [0.0003688328139679342, 0.2626956699016061, -0.9648786705992114, 0.1389369718434879]
     - [-0.9999178241811533, 0.012461225746144888, 0.003010438129537496, 0.010925959852390895]
     - [0.0, 0.0, 0.0, 1.0]
-  # 左腕 RGB 内参 1280x800 · BROWN_CONRADY_K6（Orbbec EEPROM）
+  # 左腕 CV3H7610000L · RGB 1280x800 · BROWN_CONRADY_K6（Orbbec EEPROM）
   wrist_intrinsics:
     fx: 615.039856
     fy: 615.071167
@@ -123,7 +149,16 @@ calib:
     cy: 401.217224
     # OpenCV: k1,k2,p1,p2,k3,k4,k5,k6
     distortion_coefficients: [-1.30164409, 0.86659974, 0.00031279, -0.00004894, -0.19230975, -1.28480470, 0.84361118, -0.18328477]
-  wrist_depth_scale: 0.001   # Gemini305 uint16 mm → m（D405 旧值 0.0001）
+  # 右腕 CV3H761000XG · 大板单臂 cam3（与左腕内参不同）
+  wrist_intrinsics_right:
+    fx: 614.507324
+    fy: 614.454285
+    cx: 630.646362
+    cy: 401.800934
+    distortion_coefficients: [-1.15892792, 0.61664081, -0.00001411, -0.00074947, -0.07133944, -1.14106739, 0.59159726, -0.06147373]
+  # Orbbec DEPTH_UNIT_FLEXIBLE：depth_mm = raw * valueScale(0.1) → depth_m = raw * 0.0001
+  # 误用 0.001 会把 ~0.47m 读成 ~4.7m（batch_050 漂到背景即此）
+  wrist_depth_scale: 0.0001
   head_fixed_depth_cam_m: 0.85
   # PCB 上表面 base-Z = 夹爪 tip（arm_*_linkTCP）贴板高度；与 motion.grasp_z_m 同源
   # 2026-11-10：末端已改为夹爪尖，不再是法兰；旧值 -0.48 作废
@@ -235,7 +270,8 @@ cameras:
   # 主相机 / FFS 左目 = 7。6 只作为立体右图，不再做手眼和定位参考。
   portal_head_left_id: 7
   portal_head_right_id: 6
-  portal_max_hz: 8
+  # 与 capture_camera_subscribe 同路 get_latest_frame；腕粗 10 帧要跟上
+  portal_max_hz: 15
   portal_timeout_s: 60
   head_left: /dev/video7
   head_right: /dev/video6
@@ -249,7 +285,8 @@ cameras:
   portal_wrist_right_id: 3      # 右腕 CV3H761000XG
   portal_wrist_right_depth_id: 2
   wrist_need_depth: true
-  wrist_undistort: true        # 305 畸变大，精定位前去畸变
+  # 305：门户深度已对齐原始彩色；去畸变会撕碎深度（batch_050 满屏 4m 即此因）
+  wrist_undistort: false
   wrist_serial: "262422274334" # 仅 wrist_source=d405
   wrist_width: 1280
   wrist_height: 800

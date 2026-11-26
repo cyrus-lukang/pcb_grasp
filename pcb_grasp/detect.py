@@ -101,6 +101,81 @@ class YoloPoseDetector:
         return dets[0] if dets else None
 
 
+def _unmap_uv_from_flip(
+    u: float, v: float, *, flip: str, h: int, w: int
+) -> tuple[float, float]:
+    """把翻转/旋转图上的像素坐标映回原图。"""
+    if flip in ("", "orig", "none"):
+        return float(u), float(v)
+    if flip == "vflip":
+        return float(u), float(h - 1 - v)
+    if flip == "hflip":
+        return float(w - 1 - u), float(v)
+    if flip == "rot180":
+        return float(w - 1 - u), float(h - 1 - v)
+    return float(u), float(v)
+
+
+def _remap_det_to_orig(
+    det: PcbDetection, *, flip: str, h: int, w: int
+) -> PcbDetection:
+    corners = [
+        _unmap_uv_from_flip(float(u), float(v), flip=flip, h=h, w=w)
+        for u, v in det.corners
+    ]
+    box = None
+    if det.box and len(det.box) >= 4:
+        x1, y1, x2, y2 = (float(x) for x in det.box[:4])
+        p1 = _unmap_uv_from_flip(x1, y1, flip=flip, h=h, w=w)
+        p2 = _unmap_uv_from_flip(x2, y2, flip=flip, h=h, w=w)
+        box = [
+            min(p1[0], p2[0]),
+            min(p1[1], p2[1]),
+            max(p1[0], p2[0]),
+            max(p1[1], p2[1]),
+        ]
+    return PcbDetection(
+        corners=corners, box=box, conf=float(det.conf), cls_id=int(det.cls_id)
+    )
+
+
+def detect_with_flip_fallback(
+    detector: YoloPoseDetector,
+    image_bgr: np.ndarray,
+    *,
+    flips: Sequence[str] = ("vflip", "hflip", "rot180"),
+) -> tuple[list[PcbDetection], str]:
+    """原图先检；无框时再垂直/水平/180°翻转检，UV 映回原图。
+
+    Returns:
+        (dets_in_original_uv, flip_name)  flip_name 为 ``orig`` 或所用变换名。
+    """
+    import cv2
+
+    dets = detector.detect(image_bgr)
+    if dets:
+        return dets, "orig"
+    h, w = int(image_bgr.shape[0]), int(image_bgr.shape[1])
+    for name in flips:
+        if name == "vflip":
+            im = cv2.flip(image_bgr, 0)
+        elif name == "hflip":
+            im = cv2.flip(image_bgr, 1)
+        elif name == "rot180":
+            im = cv2.rotate(image_bgr, cv2.ROTATE_180)
+        else:
+            continue
+        dets_f = detector.detect(im)
+        if not dets_f:
+            continue
+        remapped = [
+            _remap_det_to_orig(d, flip=name, h=h, w=w) for d in dets_f
+        ]
+        remapped.sort(key=lambda d: d.conf, reverse=True)
+        return remapped, name
+    return [], "orig"
+
+
 def draw_detection(image_bgr: np.ndarray, det: PcbDetection) -> np.ndarray:
     import cv2
 

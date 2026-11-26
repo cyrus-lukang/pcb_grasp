@@ -41,7 +41,14 @@ class GraspConfig:
     wrist_cx: float = 630.0
     wrist_cy: float = 401.0
     wrist_dist_coeffs: list[float] | None = None  # OpenCV k1,k2,p1,p2,k3,k4,k5,k6
-    wrist_depth_scale: float = 0.001  # Gemini305 uint16 mm → m；D405 常用 0.0001
+    # 右腕内参（缺省回落左腕）
+    wrist_fx_right: float | None = None
+    wrist_fy_right: float | None = None
+    wrist_cx_right: float | None = None
+    wrist_cy_right: float | None = None
+    wrist_dist_coeffs_right: list[float] | None = None
+    # Orbbec valueScale=0.1 → depth_m = raw * 0.0001
+    wrist_depth_scale: float = 0.0001
     # True：精定位 camZ 固定用 hover_height（粗定位悬停高），不采腕深图
     wrist_use_fixed_hover_depth: bool = True
 
@@ -125,7 +132,7 @@ class GraspConfig:
     cam_portal: str = "10.3.8.7:8787"
     cam_portal_head_left_id: int = 7
     cam_portal_head_right_id: int = 6
-    cam_portal_max_hz: float = 8.0
+    cam_portal_max_hz: float = 15.0
     cam_portal_timeout_s: float = 60.0
     cam_head_left: str = "/dev/video7"
     cam_head_right: str = "/dev/video6"
@@ -139,7 +146,7 @@ class GraspConfig:
     cam_portal_wrist_right_id: int = 3  # 右臂彩色
     cam_portal_wrist_right_depth_id: int = 2  # 右臂 Z16
     cam_wrist_need_depth: bool = True
-    cam_wrist_undistort: bool = True
+    cam_wrist_undistort: bool = False  # 305：深度对齐原始彩色，默认不去畸变
     cam_wrist_serial: str = "262422274334"  # 仅 d405
     cam_wrist_width: int = 1280
     cam_wrist_height: int = 800
@@ -197,14 +204,35 @@ class GraspConfig:
     # 接近停靠相对板面抬高；None → 复用 large_fine_hover_height_m
     large_approach_hover_height_m: float | None = None
     large_fine_match_max_dist_m: float = 0.15
-    # 大板单臂支路 B：无头相机；腕部粗定位 → 左臂精看 P2/P3 → 停 mid23
+    # 精拍到位后原地等识别秒数：认到立刻继续，超时才报未识别
+    large_fine_detect_wait_s: float = 10.0
+    # 大板单臂支路 B：无头；右腕 cam3 腕粗 → 精 P2/P3 → 停 mid
     large_single_enable: bool = True
-    # 粗定位固定法兰 [x,y,z,rx,ry,rz]（米/弧度）；null=后面写死，未配则用当前 TCP
+    large_single_arm: str = "right"
+    large_single_cam_id: int = 3
+    large_single_depth_cam_id: int = 2
+    large_single_coarse_pose_weights: str = ""
+    large_single_coarse_imgsz: int = 480
+    large_single_coarse_n_corners: int = 4
+    large_single_fine_pose_weights: str = ""
+    large_single_fine_imgsz: int = 480
+    large_single_fine_n_corners: int = 1
+    # 粗定位固定法兰 [x,y,z,rx,ry,rz]（米/弧度）；null=当前 TCP
     large_single_coarse_flange: list[float] | None = None
-    # 精定位后停在 mid(P2,P3) 的 tip/板面上方相机高度（米）；null=后面写死
+    # 精拍 tipZ = 角点Z + hover；精反投影固定 cam 深
+    large_single_fine_hover_height_m: float | None = 0.30
+    large_single_fine_fixed_depth_m: float = 0.30
+    # 大板外形（米）：P2P3=长边 length；垂直边=width → 停 tip = 板心
+    # center = mid(P2,P3) + (width/2) * n̂_inward（不再用固定 13cm 偏移）
+    large_board_width_m: float = 0.27
+    large_board_length_m: float = 0.36
+    # 兼容旧字段；None=用 width/2 算板心。勿再写死 0.13
+    large_single_stop_dy_m: float | None = None
+    large_single_stop_z_above_board_m: float = 0.10
     large_single_stop_z_m: float | None = None
-    # 单臂精定位悬停高度（相对板面）；null 复用 large_fine_hover_height_m
-    large_single_fine_hover_height_m: float | None = None
+    large_single_stop_rz_offset_deg: float = 36.87
+    # True：T_base_cam 直接用机上 arm_*_305g_frame（rim_python.camera_pose），不用 yaml 手眼
+    large_single_cam_pose_from_tf: bool = True
 
 
 def _load_raw(path: Path) -> dict[str, Any]:
@@ -309,19 +337,40 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     if Ttc_r is not None and Ttc_r not in ("null", ""):
         cfg.T_tool_cam_right = _mat4(Ttc_r)
 
+    def _load_wrist_intrinsics(block: dict) -> tuple[float, float, float, float, list[float] | None]:
+        fx = float(block.get("fx", 615.0))
+        fy = float(block.get("fy", fx))
+        cx = float(block.get("cx", 630.0))
+        cy = float(block.get("cy", 401.0))
+        dist = block.get("distortion_coefficients") or block.get("dist_coeffs")
+        coeffs: list[float] | None
+        if dist is not None:
+            coeffs = [float(x) for x in dist]
+        else:
+            keys = ("k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6")
+            if any(k in block for k in keys):
+                coeffs = [float(block.get(k, 0.0)) for k in keys]
+            else:
+                coeffs = None
+        return fx, fy, cx, cy, coeffs
+
     wi = g("calib", "wrist_intrinsics", default={}) or {}
-    cfg.wrist_fx = float(wi.get("fx", cfg.wrist_fx))
-    cfg.wrist_fy = float(wi.get("fy", cfg.wrist_fy))
-    cfg.wrist_cx = float(wi.get("cx", cfg.wrist_cx))
-    cfg.wrist_cy = float(wi.get("cy", cfg.wrist_cy))
-    dist = wi.get("distortion_coefficients") or wi.get("dist_coeffs")
-    if dist is not None:
-        cfg.wrist_dist_coeffs = [float(x) for x in dist]
-    else:
-        # 兼容拆开写的 k1..k6 / p1 p2
-        keys = ("k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6")
-        if any(k in wi for k in keys):
-            cfg.wrist_dist_coeffs = [float(wi.get(k, 0.0)) for k in keys]
+    (
+        cfg.wrist_fx,
+        cfg.wrist_fy,
+        cfg.wrist_cx,
+        cfg.wrist_cy,
+        cfg.wrist_dist_coeffs,
+    ) = _load_wrist_intrinsics(wi)
+    wi_r = g("calib", "wrist_intrinsics_right", default=None)
+    if wi_r:
+        (
+            cfg.wrist_fx_right,
+            cfg.wrist_fy_right,
+            cfg.wrist_cx_right,
+            cfg.wrist_cy_right,
+            cfg.wrist_dist_coeffs_right,
+        ) = _load_wrist_intrinsics(wi_r)
     cfg.wrist_depth_scale = float(
         g("calib", "wrist_depth_scale", default=cfg.wrist_depth_scale)
     )
@@ -567,9 +616,44 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     cfg.large_fine_match_max_dist_m = float(
         lb.get("fine_match_max_dist_m", cfg.large_fine_match_max_dist_m)
     )
+    cfg.large_fine_detect_wait_s = float(
+        lb.get("fine_detect_wait_s", cfg.large_fine_detect_wait_s)
+    )
     # 单臂支路 B
     sa = lb.get("single_arm", {}) or {}
     cfg.large_single_enable = bool(sa.get("enable", cfg.large_single_enable))
+    cfg.large_single_arm = str(
+        sa.get("arm", cfg.large_single_arm) or "right"
+    ).strip().lower()
+    cfg.large_single_cam_id = int(sa.get("cam_id", cfg.large_single_cam_id) or 3)
+    cfg.large_single_depth_cam_id = int(
+        sa.get("depth_cam_id", cfg.large_single_depth_cam_id) or 2
+    )
+    cw = sa.get("coarse_pose_weights", cfg.large_single_coarse_pose_weights)
+    if cw in (None, "null", ""):
+        cfg.large_single_coarse_pose_weights = ""
+    else:
+        cfg.large_single_coarse_pose_weights = _resolve_path(root, str(cw))
+    cfg.large_single_coarse_imgsz = int(
+        sa.get("coarse_imgsz", cfg.large_single_coarse_imgsz) or 480
+    )
+    cfg.large_single_coarse_n_corners = int(
+        sa.get("coarse_n_corners", cfg.large_single_coarse_n_corners) or 4
+    )
+    fw = sa.get("fine_pose_weights", cfg.large_single_fine_pose_weights)
+    if fw in (None, "null", ""):
+        # 兼容：未单独配精模时回落 large_board.wrist_pose_weights
+        cfg.large_single_fine_pose_weights = str(
+            cfg.large_wrist_pose_weights or ""
+        )
+    else:
+        cfg.large_single_fine_pose_weights = _resolve_path(root, str(fw))
+    cfg.large_single_fine_imgsz = int(
+        sa.get("fine_imgsz", cfg.large_single_fine_imgsz) or 480
+    )
+    cfg.large_single_fine_n_corners = int(
+        sa.get("fine_n_corners", cfg.large_single_fine_n_corners) or 1
+    )
     cfl = sa.get("coarse_flange_pose", cfg.large_single_coarse_flange)
     if cfl in (None, "null", ""):
         cfg.large_single_coarse_flange = None
@@ -582,6 +666,40 @@ def load_config(path: str | Path | None = None) -> GraspConfig:
     sh = sa.get("fine_hover_height_m", cfg.large_single_fine_hover_height_m)
     cfg.large_single_fine_hover_height_m = (
         None if sh in (None, "null", "") else float(sh)
+    )
+    cfg.large_single_fine_fixed_depth_m = float(
+        sa.get("fine_fixed_depth_m", cfg.large_single_fine_fixed_depth_m) or 0.30
+    )
+    # 板面尺寸 → 停 tip 用 width/2 到几何中心（见 large_board_pcb.yaml）
+    cfg.large_board_width_m = float(
+        lb.get("board_width_m", lb.get("width_m", cfg.large_board_width_m))
+        or cfg.large_board_width_m
+    )
+    cfg.large_board_length_m = float(
+        lb.get("board_length_m", lb.get("length_m", cfg.large_board_length_m))
+        or cfg.large_board_length_m
+    )
+    # stop_dy_m: null/缺省 → 用 width/2；显式数值仅作调试覆盖
+    _sdy = sa.get("stop_dy_m", cfg.large_single_stop_dy_m)
+    cfg.large_single_stop_dy_m = (
+        None if _sdy in (None, "null", "") else float(_sdy)
+    )
+    cfg.large_single_stop_z_above_board_m = float(
+        sa.get(
+            "stop_z_above_board_m",
+            cfg.large_single_stop_z_above_board_m,
+        )
+        or 0.10
+    )
+    cfg.large_single_stop_rz_offset_deg = float(
+        sa.get(
+            "stop_rz_offset_deg",
+            cfg.large_single_stop_rz_offset_deg,
+        )
+        or 0.0
+    )
+    cfg.large_single_cam_pose_from_tf = bool(
+        sa.get("cam_pose_from_tf", cfg.large_single_cam_pose_from_tf)
     )
     return cfg
 

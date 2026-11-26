@@ -1,230 +1,186 @@
 #!/usr/bin/env python3
-"""SDK 进程：从 frame_bundle 拉最新帧，按长度前缀协议写到 stdout。
+"""SDK 进程：frame_bundle 取流，与 capture_camera_subscribe 同一路。
+
+用 ``sdk.frame_bundle.get_latest_frame()``，彩色 **原样 JPEG 直通**，
+深度 **原样 Z16 直通**（不再 CameraSource 解 JPEG→RGB 再压一遍）。
 
 协议（小端）::
-  magic = b"FB01"
+  magic = b"FB02"
   循环:
     u32 seq
     u32 n_parts
     每个 part:
       u32 cam_id
-      u8  kind   # 0=JPEG color, 1=PNG16 depth
+      u8  kind   # 0=JPEG color, 2=raw Z16 depth
+      u16 width
+      u16 height
       u32 nbytes
       bytes payload
 
-由 ``bundle_cache.BundleFrameCache`` 在 pcb_grasp/.venv 里拉起
-（本文件必须用 perception/.venv-sdk 的 python 跑）。
+由 ``bundle_cache.BundleFrameCache`` 用 perception/.venv-sdk 拉起。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import struct
 import sys
 import time
 import traceback
 
+from rim_algorithm_sdk import EndpointConfig, SDK, SDKConfig
+from robot.camera.v1 import camera_pb2
 
-def _encode_jpeg_bgr(rgb, quality: int = 85) -> bytes:
-    import cv2
-    import numpy as np
-
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        raise RuntimeError("jpeg encode failed")
-    return buf.tobytes()
+_JPEG = int(camera_pb2.IMAGE_FORMAT_JPEG)
+_Z16 = int(camera_pb2.IMAGE_FORMAT_Z16)
+_KIND_JPEG = 0
+_KIND_Z16 = 2
 
 
-def _encode_depth_png(depth_mm) -> bytes:
-    import cv2
-    import numpy as np
-
-    arr = np.asarray(depth_mm)
-    if arr.dtype != np.uint16:
-        arr = arr.astype(np.uint16)
-    ok, buf = cv2.imencode(".png", arr)
-    if not ok:
-        raise RuntimeError("depth png encode failed")
-    return buf.tobytes()
-
-
-def _write_frame(out, seq: int, parts: list[tuple[int, int, bytes]]) -> None:
+def _write_frame(
+    out, seq: int, parts: list[tuple[int, int, int, int, bytes]]
+) -> None:
     out.write(struct.pack("<II", int(seq), len(parts)))
-    for cam_id, kind, payload in parts:
-        out.write(struct.pack("<IBI", int(cam_id), int(kind), len(payload)))
+    for cam_id, kind, width, height, payload in parts:
+        out.write(
+            struct.pack(
+                "<IBHHI",
+                int(cam_id),
+                int(kind),
+                int(width),
+                int(height),
+                len(payload),
+            )
+        )
         out.write(payload)
     out.flush()
+
+
+async def _pull(
+    *,
+    target: str,
+    color_ids: set[int],
+    depth_ids: set[int],
+    hz: float,
+    connect_timeout: float,
+    out,
+) -> int:
+    period = 1.0 / max(float(hz), 0.5)
+    wanted = set(color_ids) | set(depth_ids)
+    seq = 0
+    out.write(b"FB02")
+    out.flush()
+
+    while True:
+        sdk = SDK(
+            SDKConfig(
+                frame_bundle=EndpointConfig(target=target),
+                node_name="pcb_grasp_bundle_worker",
+                default_timeout=max(2.0, connect_timeout),
+                connect_timeout=float(connect_timeout),
+            )
+        )
+        try:
+            await sdk.connect()
+            print(
+                f"bundle_worker connected target={target} "
+                f"color={sorted(color_ids)} depth={sorted(depth_ids)} hz={hz}",
+                file=sys.stderr,
+                flush=True,
+            )
+            while True:
+                t0 = time.monotonic()
+                response = await sdk.frame_bundle.get_latest_frame(
+                    timeout=max(2.0, connect_timeout)
+                )
+                packet = response.frame.camera_image
+                parts: list[tuple[int, int, int, int, bytes]] = []
+                for image in packet.images:
+                    cam_id = int(image.cam_id)
+                    if wanted and cam_id not in wanted:
+                        continue
+                    payload = bytes(image.payload)
+                    if not payload:
+                        continue
+                    fmt = int(image.format)
+                    width = int(image.width)
+                    height = int(image.height)
+                    if fmt == _JPEG and cam_id in color_ids:
+                        parts.append(
+                            (cam_id, _KIND_JPEG, width, height, payload)
+                        )
+                    elif fmt == _Z16 and cam_id in depth_ids:
+                        expect = width * height * 2
+                        if width <= 0 or height <= 0 or len(payload) != expect:
+                            print(
+                                f"bundle_worker Z16 cam{cam_id} "
+                                f"len={len(payload)} != {width}x{height}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            continue
+                        parts.append(
+                            (cam_id, _KIND_Z16, width, height, payload)
+                        )
+                if parts:
+                    seq += 1
+                    try:
+                        _write_frame(out, seq, parts)
+                    except BrokenPipeError:
+                        return 0
+                delay = period - (time.monotonic() - t0)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        except BrokenPipeError:
+            return 0
+        except Exception as exc:
+            print(f"bundle_worker: {exc}", file=sys.stderr, flush=True)
+            await asyncio.sleep(0.5)
+        finally:
+            try:
+                await sdk.close()
+            except Exception:
+                pass
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", default="10.3.8.7:50066")
-    parser.add_argument(
-        "--color",
-        default="1,3,6,7",
-        help="comma-separated color cam_ids",
-    )
-    parser.add_argument(
-        "--depth",
-        default="",
-        help="comma-separated depth cam_ids (Z16); empty = none",
-    )
-    parser.add_argument("--hz", type=float, default=8.0)
-    parser.add_argument("--jpeg-quality", type=int, default=80)
+    parser.add_argument("--color", default="1,3,6,7")
+    parser.add_argument("--depth", default="")
+    parser.add_argument("--hz", type=float, default=15.0)
     parser.add_argument("--connect-timeout", type=float, default=10.0)
+    # 兼容旧参数（已不再二次压 JPEG）
+    parser.add_argument("--jpeg-quality", type=int, default=80)
     args = parser.parse_args()
+    del args.jpeg_quality
 
-    color_ids = [int(x) for x in str(args.color).split(",") if x.strip() != ""]
-    depth_ids = [int(x) for x in str(args.depth).split(",") if x.strip() != ""]
+    color_ids = {int(x) for x in str(args.color).split(",") if x.strip() != ""}
+    depth_ids = {int(x) for x in str(args.depth).split(",") if x.strip() != ""}
     if not color_ids and not depth_ids:
         print("bundle_worker: no cameras", file=sys.stderr)
         return 2
 
-    # pipelines 必须在 path 上（run_ui / BundleFrameCache 会设 PYTHONPATH）
-    from rim_python.camera import CameraSource
-
-    cameras = {f"c{cid}": cid for cid in color_ids} if color_ids else None
-    depth_cameras = {f"d{cid}": cid for cid in depth_ids} if depth_ids else None
-    # CameraSource 不允许空 dict；无 depth 时传 None
-    if depth_cameras is not None and not depth_cameras:
-        depth_cameras = None
-
-    def _need_reconnect(exc: BaseException) -> bool:
-        msg = str(exc).lower()
-        keys = (
-            "socket closed",
-            "connection refused",
-            "connection reset",
-            "unavailable",
-            "not connected",
-            "statuscode.unavailable",
-            "broken pipe",
-            "eof",
-            "timed out",
-            "timeout",
-        )
-        return any(k in msg for k in keys)
-
-    def _make_src() -> CameraSource:
-        return CameraSource(
-            str(args.target),
-            cameras=cameras,
-            depth_cameras=depth_cameras,
-            timeout_s=max(2.0, period * 4),
-            connect_timeout_s=float(args.connect_timeout),
-            node_name="pcb_grasp_bundle_worker",
-        )
-
-    period = 1.0 / max(float(args.hz), 0.5)
-    out = sys.stdout.buffer
-    out.write(b"FB01")
-    out.flush()
-
-    src: CameraSource | None = None
-    seq = 0
-    fail_streak = 0
-    last_err = ""
-    last_err_log_t = 0.0
-    backoff = 0.2
     try:
-        while True:
-            t0 = time.monotonic()
-            if src is None:
-                try:
-                    src = _make_src()
-                    src.connect()
-                    fail_streak = 0
-                    backoff = 0.2
-                    print(
-                        f"bundle_worker connected target={args.target} "
-                        f"color={color_ids} depth={depth_ids}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                except Exception as exc:
-                    fail_streak += 1
-                    msg = str(exc)
-                    now = time.monotonic()
-                    if msg != last_err or now - last_err_log_t >= 2.0:
-                        print(
-                            f"bundle_worker connect: {exc} (retry {fail_streak})",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        last_err, last_err_log_t = msg, now
-                    try:
-                        if src is not None:
-                            src.close()
-                    except Exception:
-                        pass
-                    src = None
-                    time.sleep(min(backoff, 5.0))
-                    backoff = min(backoff * 1.5, 5.0)
-                    continue
-            try:
-                snap = src.get()
-            except Exception as exc:
-                fail_streak += 1
-                msg = str(exc)
-                now = time.monotonic()
-                if msg != last_err or now - last_err_log_t >= 2.0:
-                    print(
-                        f"bundle_worker get: {exc} (streak={fail_streak})",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    last_err, last_err_log_t = msg, now
-                if _need_reconnect(exc) or fail_streak >= 3:
-                    try:
-                        src.close()
-                    except Exception:
-                        pass
-                    src = None
-                    time.sleep(min(backoff, 5.0))
-                    backoff = min(backoff * 1.5, 5.0)
-                else:
-                    time.sleep(0.2)
-                continue
-            fail_streak = 0
-            backoff = 0.2
-            last_err = ""
-            parts: list[tuple[int, int, bytes]] = []
-            for name, image in snap.images.items():
-                try:
-                    payload = _encode_jpeg_bgr(image.image, quality=args.jpeg_quality)
-                except Exception as exc:
-                    print(f"bundle_worker jpeg {name}: {exc}", file=sys.stderr, flush=True)
-                    continue
-                parts.append((int(image.cam_id), 0, payload))
-            for name, depth in snap.depths.items():
-                try:
-                    payload = _encode_depth_png(depth.depth_mm)
-                except Exception as exc:
-                    print(f"bundle_worker depth {name}: {exc}", file=sys.stderr, flush=True)
-                    continue
-                parts.append((int(depth.cam_id), 1, payload))
-            if parts:
-                seq += 1
-                _write_frame(out, seq, parts)
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, period - elapsed))
-    except BrokenPipeError:
+        return asyncio.run(
+            _pull(
+                target=str(args.target),
+                color_ids=color_ids,
+                depth_ids=depth_ids,
+                hz=float(args.hz),
+                connect_timeout=float(args.connect_timeout),
+                out=sys.stdout.buffer,
+            )
+        )
+    except KeyboardInterrupt:
         return 0
     except Exception:
         traceback.print_exc(file=sys.stderr)
         return 1
-    finally:
-        if src is not None:
-            try:
-                src.close()
-            except Exception:
-                pass
-    return 0
 
 
 if __name__ == "__main__":
-    # 避免 SDK/日志污染 stdout 二进制流
     os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
     raise SystemExit(main())

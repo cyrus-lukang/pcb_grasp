@@ -75,6 +75,106 @@ def _pose_close_enough(cur: Sequence[float], tgt: Sequence[float]) -> bool:
     )
 
 
+def _explain_move_fail(
+    *,
+    side: str,
+    goal: Sequence[float],
+    last: Sequence[float] | None,
+    last_tail: str,
+    tries: int,
+) -> str:
+    """把 MC/CLI 尾巴 + TCP 残差翻译成可读原因（限位/超时/假成功等）。"""
+    tail = str(last_tail or "").strip()
+    tail_l = tail.lower()
+
+    reasons: list[str] = []
+    # —— 1) 底层 / 规划显式失败 ——
+    if "hal_raw_joint_status" in tail_l or "joint_status unavailable" in tail_l:
+        reasons.append(
+            "底层关节状态读不到（hal_raw_joint_status unavailable）："
+            "常见于 HAL/关节反馈中断，不一定是几何限位"
+        )
+    if "arrive timeout" in tail_l or "arrivetimeout" in tail_l.replace(" ", ""):
+        reasons.append(
+            "执行超时（arrive timeout）：规划在时限内没把 TCP 收到目标附近"
+        )
+    if "limit" in tail_l or "限位" in tail:
+        reasons.append("疑似关节/工作空间限位（MC 描述含 limit/限位）")
+    if any(
+        k in tail_l
+        for k in ("singular", "ik fail", "unreachable", "no ik", "infeasible")
+    ):
+        reasons.append("目标姿态可能不可达或靠近奇异（IK/规划拒绝）")
+    if "plan_status_code_failed" in tail_l or "规划未完成" in tail:
+        if not reasons:
+            reasons.append(f"MC 规划失败：{tail}")
+    if "plan_status_code_succeeded" in tail_l or (
+        "succeeded" in tail_l and "failed" not in tail_l
+    ):
+        reasons.append(
+            "MC 回报 SUCCEEDED 但 TCP 实测未到（假成功/短距死区常见）"
+        )
+
+    # —— 2) 用残差说明「差在哪」 ——
+    gap = ""
+    if last is not None and len(last) >= 6 and len(goal) >= 6:
+        remain_mm = float(
+            np.linalg.norm(
+                np.asarray(last[:3], dtype=float)
+                - np.asarray(goal[:3], dtype=float)
+            )
+            * 1000.0
+        )
+        dz_mm = abs(float(last[2]) - float(goal[2])) * 1000.0
+        dxy_mm = float(
+            math.hypot(
+                float(last[0]) - float(goal[0]),
+                float(last[1]) - float(goal[1]),
+            )
+            * 1000.0
+        )
+        ori = _ori_err_deg(last, goal)
+        bits: list[str] = []
+        if dxy_mm > _ARRIVE_OK_MM:
+            bits.append(f"水平差{dxy_mm:.0f}mm(阈值≤{_ARRIVE_OK_MM:.0f})")
+        if dz_mm > _ARRIVE_OK_Z_MM:
+            bits.append(f"高度差{dz_mm:.0f}mm(阈值≤{_ARRIVE_OK_Z_MM:.0f})")
+        if ori > _ARRIVE_OK_DEG:
+            bits.append(f"姿态差{ori:.1f}°(阈值≤{_ARRIVE_OK_DEG:.0f})")
+        if not bits and remain_mm > _ARRIVE_OK_MM:
+            bits.append(f"总位移差{remain_mm:.0f}mm")
+        if (
+            1.0 < remain_mm <= float(_MC_DEADZONE_MM)
+            and dz_mm <= _ARRIVE_OK_Z_MM * 2
+            and ori <= _ARRIVE_OK_DEG * 2
+        ):
+            bits.append(
+                f"残差{remain_mm:.0f}mm 接近 MC 短距死区(≤{_MC_DEADZONE_MM:.0f}mm)，"
+                "易假成功停半路"
+            )
+        gap = (
+            f"实测=({last[0]*1000:.1f},{last[1]*1000:.1f},{last[2]*1000:.1f})mm "
+            f"目标=({goal[0]*1000:.1f},{goal[1]*1000:.1f},{goal[2]*1000:.1f})mm；"
+            + ("；".join(bits) if bits else f"remain={remain_mm:.0f}mm")
+        )
+
+    if not reasons:
+        reasons.append(
+            "重试后仍未进入到位阈值（从残差看差在哪；MC 未写明限位）"
+        )
+
+    side_cn = "右" if str(side).lower().startswith("r") else "左"
+    parts = [
+        f"{side_cn}臂 move_to_pose 未到位（试了 {tries} 次）",
+        "原因: " + "；".join(reasons),
+    ]
+    if gap:
+        parts.append("残差: " + gap)
+    if tail:
+        parts.append(f"MC原文: {tail}")
+    return " | ".join(parts)
+
+
 def _arm_side(arm: str) -> str:
     a = str(arm).strip().upper()
     if a in ("A", "L", "LEFT"):
@@ -125,6 +225,71 @@ def _parse_pose_line(out: str, label: str = "current") -> list[float] | None:
         math.radians(mm_deg[4]),
         math.radians(mm_deg[5]),
     ]
+
+
+_WRIST_CAM_FRAME = {"left": "arm_l_305g_frame", "right": "arm_r_305g_frame"}
+
+
+def _parse_camera_pose_line(out: str, frame_name: str) -> list[float] | None:
+    """解析 ``arm_*_305g_frame xyz_mm=... rpy_deg=...`` → 米/弧度。"""
+    m = re.search(
+        rf"{re.escape(frame_name)}\s+xyz_mm=([-\d.,]+)\s+rpy_deg=([-\d.,]+)",
+        out,
+    )
+    if not m:
+        return None
+    xyz_mm = [float(x) for x in m.group(1).split(",")]
+    rpy_deg = [float(x) for x in m.group(2).split(",")]
+    if len(xyz_mm) < 3 or len(rpy_deg) < 3:
+        return None
+    return [
+        xyz_mm[0] / 1000.0,
+        xyz_mm[1] / 1000.0,
+        xyz_mm[2] / 1000.0,
+        math.radians(rpy_deg[0]),
+        math.radians(rpy_deg[1]),
+        math.radians(rpy_deg[2]),
+    ]
+
+
+def read_wrist_camera_pose_mat4(
+    side: str = "right",
+    *,
+    frame_bundle: str = DEFAULT_FRAME_BUNDLE,
+    timeout_s: float = 12.0,
+) -> np.ndarray:
+    """读机上腕相机相对 base_link 的 4x4（``arm_*_305g_frame``）。
+
+    等价 ``python -m rim_python.camera_pose``，不经 yaml 手眼。
+    """
+    from .geometry import pose_xyz_rpy_to_mat4
+
+    side_n = _arm_side(side)
+    frame = _WRIST_CAM_FRAME[side_n]
+    cmd = [
+        _sdk_python(),
+        "-m",
+        "rim_python.camera_pose",
+        str(frame_bundle),
+        "--timeout",
+        str(float(timeout_s)),
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=_env_with_pipelines(),
+        cwd=str(_PIPELINES),
+        timeout=float(timeout_s) + 15.0,
+    )
+    out = (proc.stdout or "") + (proc.stderr or "")
+    pose = _parse_camera_pose_line(out, frame)
+    if pose is None:
+        raise RuntimeError(
+            f"读不到 {frame} @ {frame_bundle}: "
+            f"{(out.strip().splitlines() or ['无输出'])[-1]}"
+        )
+    return pose_xyz_rpy_to_mat4(*pose)
 
 
 class RimMotion(MotionBackend):
@@ -547,19 +712,19 @@ class RimMotion(MotionBackend):
         wait_s = float(
             self.plan_timeout_s if timeout_s is None else timeout_s
         )
+        # 必须用 --pose=…：X 为负时「--pose -484,…」会被 argparse 当成新选项
         extra = [
-            "--pose",
-            pose_str,
+            f"--pose={pose_str}",
             "--execute",
             "--allow-large",
             "--timeout",
             f"{wait_s:.1f}",
         ]
         if max_linear_vel is not None and float(max_linear_vel) > 0.0:
-            extra.extend(["--max-linear-vel", f"{float(max_linear_vel):.4f}"])
+            extra.extend([f"--max-linear-vel={float(max_linear_vel):.4f}"])
         LOG.info(
             "localize→CLI%s side=%s pose_mm_deg=%s  "
-            "(cd %s && python -m rim_python.move_to_pose --arm %s --pose %s --execute)",
+            "(cd %s && python -m rim_python.move_to_pose --arm %s --pose=%s --execute)",
             f"[{tag}]" if tag else "",
             self.side,
             pose_str,
@@ -693,24 +858,16 @@ class RimMotion(MotionBackend):
             if attempt < int(_EXECUTE_RETRIES):
                 time.sleep(float(_RETRY_SLEEP_S))
 
-        detail = ""
         if last is not None:
-            remain = float(
-                np.linalg.norm(
-                    np.asarray(last[:3], dtype=float)
-                    - np.asarray(goal[:3], dtype=float)
-                )
-                * 1000.0
-            )
-            dz_mm = abs(float(last[2]) - float(goal[2])) * 1000.0
-            detail = (
-                f" (TCP remain={remain:.0f}mm ΔZ={dz_mm:.0f}mm "
-                f"ori={_ori_err_deg(last, goal):.1f}°)"
-            )
             self._pose = list(last)
         raise RuntimeError(
-            f"rim_python.move_to_pose 未到位 after {_EXECUTE_RETRIES} tries: "
-            f"{last_tail}{detail}"
+            _explain_move_fail(
+                side=self.side,
+                goal=goal,
+                last=last,
+                last_tail=last_tail,
+                tries=int(_EXECUTE_RETRIES),
+            )
         )
 
     def move_jog(

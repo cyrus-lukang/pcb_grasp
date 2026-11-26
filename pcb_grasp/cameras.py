@@ -175,7 +175,7 @@ class HeadPortalCam:
         *,
         left_cam_id: int = 7,
         right_cam_id: int = 6,
-        max_hz: float = 8.0,
+        max_hz: float = 15.0,
         timeout_s: float = 60.0,
         cache=None,
         own_cache: bool = True,
@@ -308,7 +308,7 @@ def open_portal_head_and_wrist(cfg) -> tuple[HeadPortalCam, "WristPortalCam"]:
     left_id = int(getattr(cfg, "cam_portal_head_left_id", 7))
     right_id = int(getattr(cfg, "cam_portal_head_right_id", 6))
     wrist_id = int(getattr(cfg, "cam_portal_wrist_id", 1))
-    max_hz = float(getattr(cfg, "cam_portal_max_hz", 8.0))
+    max_hz = float(getattr(cfg, "cam_portal_max_hz", 15.0))
     timeout_s = float(getattr(cfg, "cam_portal_timeout_s", 60.0))
     depth_of_color = {1: 0, 3: 2}
     wrist_depth = getattr(cfg, "cam_portal_wrist_depth_id", None)
@@ -347,7 +347,7 @@ def open_portal_head_and_wrist(cfg) -> tuple[HeadPortalCam, "WristPortalCam"]:
             cx=float(getattr(cfg, "wrist_cx", 630.0)),
             cy=float(getattr(cfg, "wrist_cy", 401.0)),
             dist_coeffs=list(dist) if dist else None,
-            undistort=bool(getattr(cfg, "cam_wrist_undistort", True)),
+            undistort=bool(getattr(cfg, "cam_wrist_undistort", False)),
             width=int(getattr(cfg, "cam_wrist_width", 1280)),
             height=int(getattr(cfg, "cam_wrist_height", 800)),
             cache=cache,
@@ -374,7 +374,8 @@ class WristPortalCam:
     """腕部 Gemini 305：frame_bundle 取流（cam1 左 / cam3 右），彩色 + 深度。
 
     深度在 bundle 里是 cam0/2，缓存会映射回彩色 cam_id。
-    305 畸变很大（BROWN_CONRADY_K6）；默认按配置内参去畸变后再给检测/匹配。
+    门户深度已与**原始彩色**对齐；不要用彩色 BROWN_CONRADY map 去 remap 深度
+    （畸变系数很大时会把深度撕成「满屏远景」）。默认也不对 305 去畸变。
     """
 
     def __init__(
@@ -382,7 +383,7 @@ class WristPortalCam:
         portal: str = "10.3.8.7:50066",
         *,
         cam_id: int = 1,
-        max_hz: float = 8.0,
+        max_hz: float = 15.0,
         timeout_s: float = 60.0,
         need_depth: bool = True,
         fx: float = 615.0,
@@ -390,7 +391,7 @@ class WristPortalCam:
         cx: float = 630.0,
         cy: float = 401.0,
         dist_coeffs: list[float] | None = None,
-        undistort: bool = True,
+        undistort: bool = False,
         width: int = 1280,
         height: int = 800,
         cache=None,
@@ -420,7 +421,7 @@ class WristPortalCam:
             self._cache = BundleFrameCache(
                 target,
                 timeout_s=timeout_s,
-                max_hz=max_hz,
+                max_hz=max(float(max_hz), 15.0),
                 wanted={self.cam_id},
                 depth_of_color=depth_of_color,
             )
@@ -452,6 +453,8 @@ class WristPortalCam:
             self._map1, self._map2 = cv2.initUndistortRectifyMap(
                 K, D, None, K, (int(width), int(height)), cv2.CV_16SC2
             )
+        self._last_seq = -1
+        self._stale_grabs = 0
         LOG.info(
             "Wrist bundle open %s cam=%d depth=%s undistort=%s own_cache=%s",
             self.portal,
@@ -461,40 +464,223 @@ class WristPortalCam:
             self._own_cache,
         )
 
-    def grab(self, *, timeout_ms: int = 5000) -> tuple[np.ndarray, np.ndarray]:
+    def _decode_color_depth(
+        self, color_b: bytes, depth_b: bytes | None
+    ) -> tuple[np.ndarray, np.ndarray]:
         import cv2
 
-        try:
-            color_b, depth_b = self._cache.wait_color_depth(
-                self.cam_id,
-                timeout_s=max(0.5, float(timeout_ms) / 1000.0),
-                need_depth=bool(self.need_depth),
-            )
-        except TimeoutError:
-            # 深度偶发晚到：至少拿彩色，深度置零
-            color_b, depth_b = self._cache.wait_color_depth(
-                self.cam_id,
-                timeout_s=max(0.5, float(timeout_ms) / 1000.0),
-                need_depth=False,
-            )
-        color = cv2.imdecode(np.frombuffer(color_b, dtype=np.uint8), cv2.IMREAD_COLOR)
+        color = cv2.imdecode(
+            np.frombuffer(color_b, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
         if color is None:
-            raise RuntimeError(f"portal wrist cam{self.cam_id} color decode failed")
-        if depth_b is None:
-            depth = np.zeros(color.shape[:2], dtype=np.uint16)
-        else:
+            raise RuntimeError(
+                f"portal wrist cam{self.cam_id} color decode failed"
+            )
+        depth = None
+        if hasattr(self._cache, "depth_u16"):
+            try:
+                depth = self._cache.depth_u16(self.cam_id)
+            except Exception:
+                depth = None
+        if depth is None and depth_b is not None:
             depth = cv2.imdecode(
                 np.frombuffer(depth_b, dtype=np.uint8), cv2.IMREAD_UNCHANGED
             )
-            if depth is None:
-                raise RuntimeError(f"portal wrist cam{self.cam_id} depth decode failed")
-            if depth.ndim == 3:
-                depth = depth[:, :, 0]
-            if depth.dtype != np.uint16:
-                depth = depth.astype(np.uint16)
+            if depth is not None:
+                if depth.ndim == 3:
+                    depth = depth[:, :, 0]
+                if depth.dtype != np.uint16:
+                    depth = depth.astype(np.uint16)
+        if depth is None:
+            depth = np.zeros(color.shape[:2], dtype=np.uint16)
         if self._map1 is not None and self._map2 is not None:
-            color = cv2.remap(color, self._map1, self._map2, cv2.INTER_LINEAR)
-            depth = cv2.remap(depth, self._map1, self._map2, cv2.INTER_NEAREST)
+            color = cv2.remap(
+                color, self._map1, self._map2, cv2.INTER_LINEAR
+            )
+        return color, depth
+
+    def grab(
+        self,
+        *,
+        timeout_ms: int = 5000,
+        fresh: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """取腕部彩色+深度。
+
+        ``fresh=True``：必须等到比上次更新的 bundle seq（动臂后精检用，防 P2/P3 同帧）。
+        超时绝不退回旧图。
+        """
+        min_seq = None
+        if fresh and self._last_seq >= 0:
+            min_seq = int(self._last_seq)
+        t_s = max(0.5, float(timeout_ms) / 1000.0)
+        try:
+            color_b, depth_b = self._cache.wait_color_depth(
+                self.cam_id,
+                timeout_s=t_s,
+                need_depth=bool(self.need_depth),
+                min_seq=min_seq,
+                allow_stale=False,
+            )
+        except TimeoutError:
+            # 深度偶发晚到：至少拿彩色；仍要求新 seq
+            try:
+                color_b, depth_b = self._cache.wait_color_depth(
+                    self.cam_id,
+                    timeout_s=t_s,
+                    need_depth=False,
+                    min_seq=min_seq,
+                    allow_stale=False,
+                )
+            except TimeoutError:
+                if not fresh:
+                    raise
+                # fresh 卡住：bounce 后再等一帧
+                self._stale_grabs += 1
+                LOG.warning(
+                    "wrist cam%d fresh timeout seq=%s want>%s ×%d → bounce",
+                    self.cam_id,
+                    getattr(self._cache, "seq", "?"),
+                    min_seq,
+                    self._stale_grabs,
+                )
+                if hasattr(self._cache, "bounce_worker"):
+                    try:
+                        self._cache.bounce_worker()
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("wrist bundle bounce failed: %s", exc)
+                barrier = int(getattr(self._cache, "seq", 0) or 0)
+                if hasattr(self._cache, "invalidate"):
+                    barrier = int(self._cache.invalidate(self.cam_id))
+                self._last_seq = barrier
+                color_b, depth_b = self._cache.wait_color_depth(
+                    self.cam_id,
+                    timeout_s=max(2.0, t_s),
+                    need_depth=False,
+                    min_seq=barrier,
+                    allow_stale=False,
+                )
+        seq = int(getattr(self._cache, "seq", 0) or 0)
+        if min_seq is not None and seq <= min_seq:
+            # 不应落到这里（allow_stale=False）；防御性再拒一次
+            raise TimeoutError(
+                f"wrist cam{self.cam_id} refused stale seq={seq} want>{min_seq}"
+            )
+        self._stale_grabs = 0
+        self._last_seq = seq
+        return self._decode_color_depth(color_b, depth_b)
+
+    def current_seq(self) -> int:
+        return int(getattr(self._cache, "seq", 0) or 0)
+
+    def flush_and_grab(
+        self,
+        *,
+        n_drop: int = 5,
+        timeout_ms: int = 5000,
+        pre_seq: int | None = None,
+        ref_bgr: np.ndarray | None = None,
+        max_corr: float = 0.90,
+        content_wait_s: float = 3.0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """动臂到位后：清缓存 → 丢新帧 →（可选）与粗定位图比内容，够新才返回。
+
+        ``pre_seq``：动臂前的 bundle seq；必须等到 seq>pre_seq，避免管道里
+        还在路上的粗定位 JPEG 被当成「新帧」（用户：还没到位就拍了 P2 图）。
+        ``ref_bgr``：粗定位原图；corr 过高则继续丢帧直到画面变了。
+        """
+        import time as _time
+
+        # 先停一瞬，让相机曝光反映新位姿，再清缓存
+        try:
+            _time.sleep(0.35)
+        except Exception:
+            pass
+
+        barrier = int(getattr(self._cache, "seq", 0) or 0)
+        if pre_seq is not None:
+            barrier = max(barrier, int(pre_seq))
+        if hasattr(self._cache, "invalidate"):
+            inv = int(self._cache.invalidate(self.cam_id))
+            barrier = max(barrier, inv)
+        self._last_seq = barrier
+        t_s = max(1.0, float(timeout_ms) / 1000.0)
+        last = barrier
+        color_b: bytes | None = None
+        depth_b: bytes | None = None
+        n = max(1, int(n_drop))
+        for i in range(n):
+            try:
+                color_b, depth_b = self._cache.wait_color_depth(
+                    self.cam_id,
+                    timeout_s=t_s,
+                    need_depth=bool(self.need_depth) and i == n - 1,
+                    min_seq=last,
+                    allow_stale=False,
+                )
+            except TimeoutError:
+                color_b, depth_b = self._cache.wait_color_depth(
+                    self.cam_id,
+                    timeout_s=t_s,
+                    need_depth=False,
+                    min_seq=last,
+                    allow_stale=False,
+                )
+            last = int(getattr(self._cache, "seq", 0) or 0)
+            LOG.info(
+                "wrist cam%d flush drop %d/%d seq=%d (barrier=%d pre=%s)",
+                self.cam_id,
+                i + 1,
+                n,
+                last,
+                barrier,
+                pre_seq,
+            )
+        self._last_seq = last
+        if color_b is None:
+            raise TimeoutError(
+                f"wrist cam{self.cam_id} flush_and_grab got no frame"
+            )
+        color, depth = self._decode_color_depth(color_b, depth_b)
+
+        # 内容门：必须和粗定位图明显不同，否则继续等新帧
+        if ref_bgr is not None and ref_bgr.size > 0:
+            t_end = _time.monotonic() + float(content_wait_s)
+            while _time.monotonic() < t_end:
+                corr = _bgr_corr(ref_bgr, color)
+                if corr < float(max_corr):
+                    LOG.info(
+                        "wrist cam%d post-arrive frame OK corr=%.3f "
+                        "(<%.2f vs coarse) seq=%d",
+                        self.cam_id,
+                        corr,
+                        max_corr,
+                        self._last_seq,
+                    )
+                    break
+                LOG.warning(
+                    "wrist cam%d post-arrive still looks like coarse "
+                    "corr=%.3f → drop more (seq=%d)",
+                    self.cam_id,
+                    corr,
+                    self._last_seq,
+                )
+                try:
+                    color, depth = self.grab(
+                        timeout_ms=timeout_ms, fresh=True
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("wrist content-wait grab failed: %s", exc)
+                    break
+            else:
+                corr = _bgr_corr(ref_bgr, color)
+                LOG.error(
+                    "wrist cam%d post-arrive frame STILL ~coarse "
+                    "corr=%.3f after %.1fs — 仍用于识别但已打标",
+                    self.cam_id,
+                    corr,
+                    content_wait_s,
+                )
         return color, depth
 
     def close(self) -> None:
@@ -504,6 +690,22 @@ class WristPortalCam:
             self._cache.close()
         except Exception:
             pass
+
+
+def _bgr_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """粗相关：1=几乎同一张图。"""
+    if a is None or b is None or a.size == 0 or b.size == 0:
+        return 0.0
+    if a.shape != b.shape:
+        import cv2
+
+        b = cv2.resize(b, (a.shape[1], a.shape[0]))
+    aa = a.astype(np.float32).ravel()
+    bb = b.astype(np.float32).ravel()
+    aa = aa - float(aa.mean())
+    bb = bb - float(bb.mean())
+    den = float(np.linalg.norm(aa) * np.linalg.norm(bb)) + 1e-9
+    return float(aa @ bb) / den
 
 
 class WristD405Cam:
@@ -644,7 +846,7 @@ def open_wrist_camera(cfg):
             getattr(cfg, "rim_frame_bundle", None)
             or getattr(cfg, "cam_portal", "10.3.8.7:50066"),
             cam_id=int(getattr(cfg, "cam_portal_wrist_id", 1)),
-            max_hz=float(getattr(cfg, "cam_portal_max_hz", 8.0)),
+            max_hz=float(getattr(cfg, "cam_portal_max_hz", 15.0)),
             timeout_s=float(getattr(cfg, "cam_portal_timeout_s", 60.0)),
             need_depth=bool(getattr(cfg, "cam_wrist_need_depth", True)),
             fx=float(getattr(cfg, "wrist_fx", 615.0)),
@@ -652,7 +854,7 @@ def open_wrist_camera(cfg):
             cx=float(getattr(cfg, "wrist_cx", 630.0)),
             cy=float(getattr(cfg, "wrist_cy", 401.0)),
             dist_coeffs=list(dist) if dist else None,
-            undistort=bool(getattr(cfg, "cam_wrist_undistort", True)),
+            undistort=bool(getattr(cfg, "cam_wrist_undistort", False)),
             width=int(getattr(cfg, "cam_wrist_width", 1280)),
             height=int(getattr(cfg, "cam_wrist_height", 800)),
             depth_cam_id=int(depth_id) if depth_id is not None else None,

@@ -75,11 +75,11 @@
       <p class="vis-meta" id="vis-meta">等待相机…</p>
     </section>
     <section class="card">
-      <label>腕部相机</label>
+      <label id="wrist-label">腕部相机</label>
       <div class="vis-wrap">
         <img id="wrist-vis" alt="wrist camera" />
       </div>
-      <p class="vis-meta" id="wrist-meta">腕部识别图（单臂大板：粗定位腕图叠点）</p>
+      <p class="vis-meta" id="wrist-meta">腕部识别图（单臂大板：粗/精实时）</p>
     </section>
 
     <section class="card">
@@ -90,7 +90,7 @@
             <option value="auto">auto（头粗 cls：小板/大板双臂）</option>
             <option value="small">小板</option>
             <option value="large">大板双臂</option>
-            <option value="large_single">大板单臂（腕粗，无头）</option>
+            <option value="large_single">大板单臂（右腕 cam3，无头）</option>
           </select>
         </div>
         <div class="check">
@@ -230,8 +230,45 @@
       }
       return data;
     }
+    function currentForce() {
+      return document.getElementById("force").value;
+    }
+    function isLargeSingle() {
+      return currentForce() === "large_single";
+    }
+    function updateVisLabels() {
+      const headLabel = document.getElementById("head-label");
+      const wristLabel = document.getElementById("wrist-label");
+      if (isLargeSingle()) {
+        if (headLabel) headLabel.textContent = "右腕粗定位（cam3 实时）";
+        if (wristLabel) wristLabel.textContent = "右腕精定位（cam3 实时）";
+      } else {
+        if (headLabel) headLabel.textContent = "头部 / 规划图";
+        if (wristLabel) wristLabel.textContent = "腕部相机";
+      }
+    }
     async function refreshPreview() {
-      if (showPlanImage || awaitingConfirm) return;
+      if (awaitingConfirm) return;
+      // 单臂大板：空闲刷 live；有结果快照时定格粗/精叠图
+      if (isLargeSingle()) {
+        updateVisLabels();
+        const t = Date.now();
+        if (showPlanImage) {
+          headVis.src = "/api/head.jpg?mode=large_single&role=coarse&snapshot=1&t=" + t;
+          if (wristVis) wristVis.src = "/api/wrist.jpg?role=fine&snapshot=1&t=" + t;
+          visMeta.textContent = "粗定位结果 " + new Date().toLocaleTimeString();
+          if (wristMeta) wristMeta.textContent = "精定位结果 " + new Date().toLocaleTimeString();
+          return;
+        }
+        headVis.src = "/api/head.jpg?mode=large_single&role=coarse&live=1&t=" + t;
+        if (wristVis) wristVis.src = "/api/wrist.jpg?role=fine&live=1&t=" + t;
+        const ts = new Date().toLocaleTimeString();
+        visMeta.textContent = "粗定位实时 " + ts;
+        if (wristMeta) wristMeta.textContent = "精定位实时 " + ts;
+        return;
+      }
+      if (showPlanImage) return;
+      updateVisLabels();
       headVis.src = "/api/head.jpg?t=" + Date.now();
       if (wristVis) wristVis.src = "/api/wrist.jpg?t=" + Date.now();
       visMeta.textContent = "实时预览 " + new Date().toLocaleTimeString();
@@ -253,7 +290,7 @@
     function cliLine(arm, arr) {
       const csv = poseCsv(arr);
       if (!csv) return "—";
-      return `python -m rim_python.move_to_pose --arm ${arm || "left"} --pose ${csv} --execute --allow-large`;
+      return `python -m rim_python.move_to_pose --arm ${arm || "left"} --pose=${csv} --execute --allow-large`;
     }
     function fmtXY(xy) {
       if (!xy || xy.length < 2) return "—";
@@ -288,16 +325,35 @@
         return;
       }
       if (mode === "large_single") {
-        const curL = result.current_xyzrpy_mm_deg || flangeToMmDeg(result.current_flange);
+        const arm = cli.arm || "right";
+        const curR =
+          result.current_right_xyzrpy_mm_deg
+          || flangeToMmDeg(result.current_flange_right)
+          || result.current_xyzrpy_mm_deg
+          || flangeToMmDeg(result.current_flange);
+        const arriveP2 =
+          result.arrive_p2_xyzrpy_mm_deg
+          || flangeToMmDeg(result.arrive_p2_flange)
+          || flangeToMmDeg(result.hover_flange);
+        const arriveP3 =
+          result.arrive_p3_xyzrpy_mm_deg
+          || flangeToMmDeg(result.arrive_p3_flange);
         const stop = result.fine_xyzrpy_mm_deg || flangeToMmDeg(result.fine_flange);
         poseXy.textContent = [
-          `grasp_mode=large_single  ID=${result.target_board_id ?? "—"}  （腕粗，无头）`,
+          `grasp_mode=large_single  ID=${result.target_board_id ?? "—"}  （右腕 cam3 · 无头）`,
           ``,
-          `# 当前左臂`,
-          cli.current_left || cli.current || cliLine("left", curL),
+          `# 当前右臂`,
+          cli.current_right || cli.current || cliLine(arm, curR),
           ``,
-          `# 停 mid23`,
-          cli.fine || cliLine("left", stop),
+          `# 精开始 P2：相机光心在角点上方 25cm · 光轴朝下（CLI 里是法兰位姿，Z≠光心Z）`,
+          cli.arrive_p2 || cli.coarse || cliLine(arm, arriveP2),
+          ``,
+          `# 精开始 P3：同上 · 光心角点+25cm · 光轴朝下`,
+          cli.arrive_p3 || cliLine(arm, arriveP3),
+          ``,
+          `# 停位：板心=mid(P2,P3)+(宽/2)×板内法向 · Z=角点+10cm · rx=-90 ry=90 rz=算+36.87°`,
+          (cli.fine || cli.stop)
+            || (stop ? cliLine(arm, stop) : "—（等精定位 pose 匹配更新 P2/P3）"),
         ].join("\n");
         return;
       }
@@ -336,14 +392,40 @@
         return;
       }
       const z = print.grasp_z_m != null ? Number(print.grasp_z_m).toFixed(4) : "?";
+      const tipZ = (t) => {
+        if (!t || t.length < 3) return "";
+        return ` tip=(${Number(t[0]).toFixed(4)}, ${Number(t[1]).toFixed(4)}, ${Number(t[2]).toFixed(4)})`;
+      };
+      const stopMm = print.stop_flange_mm_deg;
       planXy.textContent =
         `mid_mode=${print.mid_mode || "?"}\n` +
         (print.p2_xy ? `P2_xy = ${fmtXY(print.p2_xy)}\n` : "") +
         (print.p3_xy ? `P3_xy = ${fmtXY(print.p3_xy)}\n` : "") +
+        (print.mid23_xy ? `mid23_xy = ${fmtXY(print.mid23_xy)}\n` : "") +
         (print.p0_xy ? `P0_xy = ${fmtXY(print.p0_xy)}\n` : "") +
-        `tipL_xy = ${fmtXY(print.tip_left_xy)}\n` +
+        (print.arrive_p2_tip ? `arrive_P2${tipZ(print.arrive_p2_tip)}\n` : "") +
+        (print.arrive_p3_tip ? `arrive_P3${tipZ(print.arrive_p3_tip)}\n` : "") +
+        (print.tip_stop_xy
+          ? `stop_tip_xy = ${fmtXY(print.tip_stop_xy)}` +
+            (print.tip_stop_z != null ? ` z=${Number(print.tip_stop_z).toFixed(4)}\n` : "\n")
+          : "") +
+        (stopMm
+          ? `stop_mm_deg = (${stopMm.map((v) => Number(v).toFixed(1)).join(", ")})\n`
+          : "") +
+        (print.tip_left_xy ? `tipL_xy = ${fmtXY(print.tip_left_xy)}\n` : "") +
         (print.tip_right_xy ? `tipR_xy = ${fmtXY(print.tip_right_xy)}\n` : "") +
-        `grasp_z = ${z} m`;
+        `grasp_z = ${z} m` +
+        (print.fine_hover_height_m != null
+          ? `\nfine_hover = ${Number(print.fine_hover_height_m).toFixed(3)} m`
+          : "") +
+        (print.board_width_m != null
+          ? `\nboard = ${(Number(print.board_width_m)*1000).toFixed(0)}×${(Number(print.board_length_m||0)*1000).toFixed(0)} mm`
+          : "") +
+        (print.stop_half_width_m != null
+          ? `\nstop = center (half_w=${Number(print.stop_half_width_m).toFixed(3)} m)`
+          : print.stop_dy_m != null
+            ? `\nstop_half_w = ${Number(print.stop_dy_m).toFixed(3)} m`
+            : "");
     }
 
     async function pollJob() {
@@ -359,7 +441,19 @@
         }
         if (!s.awaiting_confirm) setStatus("运行中… " + (s.message || s.batch_dir || ""), "run");
         else setStatus(s.confirm_message || "大板可内收…", "run");
-        if (s.has_wrist_vis && wristVis) {
+        if (isLargeSingle()) {
+          // 作业中：有粗/精快照就定格，否则继续 live
+          if (s.has_coarse_vis || s.has_fine_vis || s.has_wrist_vis) {
+            showPlanImage = true;
+            const t = Date.now();
+            headVis.src = "/api/head.jpg?mode=large_single&role=coarse&snapshot=1&t=" + t;
+            if (wristVis) wristVis.src = "/api/wrist.jpg?role=fine&snapshot=1&t=" + t;
+            visMeta.textContent = "粗定位结果 " + new Date().toLocaleTimeString();
+            if (wristMeta) wristMeta.textContent = "精定位结果 " + new Date().toLocaleTimeString();
+          } else {
+            refreshPreview();
+          }
+        } else if (s.has_wrist_vis && wristVis) {
           wristVis.src = "/api/wrist.jpg?t=" + Date.now();
           if (wristMeta) wristMeta.textContent = "腕部 " + new Date().toLocaleTimeString();
         }
@@ -371,7 +465,15 @@
       if (s.result) {
         out.textContent = JSON.stringify(s.result, null, 2);
         renderPlanXy(s.result);
-        if (s.result.debug && s.result.debug.stage === "plan_only") {
+        if (isLargeSingle() && (s.has_coarse_vis || s.has_fine_vis || s.has_wrist_vis)) {
+          showPlanImage = true;
+          const t = Date.now();
+          headVis.src = "/api/head.jpg?mode=large_single&role=coarse&snapshot=1&t=" + t;
+          if (wristVis) wristVis.src = "/api/wrist.jpg?role=fine&snapshot=1&t=" + t;
+          visMeta.textContent = "粗定位结果（约 8s 后恢复实时）";
+          if (wristMeta) wristMeta.textContent = "精定位结果（约 8s 后恢复实时）";
+          setTimeout(() => { showPlanImage = false; }, 8000);
+        } else if (s.result.debug && s.result.debug.stage === "plan_only") {
           showPlanImage = true;
           headVis.src = "/api/confirm.jpg?t=" + Date.now();
           visMeta.textContent = "定位结果图（即将恢复预览）";
@@ -419,7 +521,7 @@
         }
         const force = document.getElementById("force").value;
         const msg = force === "large_single"
-          ? "全流程·单臂：腕粗 → 精 P2/P3 → 停 mid23…"
+          ? "全流程·单臂右：腕粗(真实深) → 精P2/P3(+30cm朝下) → 停板心/+10cm…"
           : force === "large"
             ? "全流程·双臂：头粗 → 腕精 → 接近 mid23+dx/±dy…"
             : "全流程…";
@@ -523,7 +625,13 @@
         if (!pollTimer) renderConfirm(s);
       } catch (_) {}
     }, 1200);
-    previewTimer = setInterval(refreshPreview, 2500);
+    // 预览已下采样且默认不检测；400ms 刷新接近采集页手感
+    previewTimer = setInterval(refreshPreview, 400);
+    document.getElementById("force").addEventListener("change", () => {
+      updateVisLabels();
+      refreshPreview();
+    });
+    updateVisLabels();
   </script>
 </body>
 </html>

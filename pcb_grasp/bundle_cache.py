@@ -62,7 +62,7 @@ class BundleFrameCache:
         target: str = DEFAULT_BUNDLE,
         *,
         timeout_s: float = 5.0,
-        max_hz: float = 8.0,
+        max_hz: float = 15.0,
         wanted: set[int] | None = None,
         depth_of_color: dict[int, int] | None = None,
         on_error: Callable[[str], None] | None = None,
@@ -78,6 +78,8 @@ class BundleFrameCache:
         self._lock = threading.Lock()
         self._jpegs: dict[int, bytes] = {}
         self._depths: dict[int, bytes] = {}  # keyed by COLOR cam_id
+        # FB02 raw Z16 → (H, W)；FB01 PNG 时为 None（走 imdecode）
+        self._depth_shape: dict[int, tuple[int, int]] = {}
         self._seq = 0
         self._connected = False
         self._error = ""
@@ -130,6 +132,52 @@ class BundleFrameCache:
         with self._lock:
             return self._depths.get(int(cam_id))
 
+    def depth_u16(self, cam_id: int):
+        """返回 uint16 深度图；FB02 raw Z16 或 FB01 PNG 均可。"""
+        import cv2
+        import numpy as np
+
+        with self._lock:
+            raw = self._depths.get(int(cam_id))
+            shape = self._depth_shape.get(int(cam_id))
+        if raw is None:
+            return None
+        if shape is not None:
+            h, w = int(shape[0]), int(shape[1])
+            arr = np.frombuffer(raw, dtype="<u2")
+            if arr.size != h * w:
+                return None
+            return np.ascontiguousarray(arr.reshape(h, w))
+        # 旧 FB01：PNG16
+        depth = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            return None
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        if depth.dtype != np.uint16:
+            depth = depth.astype(np.uint16)
+        return depth
+
+    def invalidate(self, cam_id: int | None = None) -> int:
+        """清空缓存图，返回清空前的 seq。动臂到位后必须先清再等新帧。"""
+        with self._lock:
+            barrier = int(self._seq)
+            if cam_id is None:
+                self._jpegs.clear()
+                self._depths.clear()
+                self._depth_shape.clear()
+            else:
+                cid = int(cam_id)
+                self._jpegs.pop(cid, None)
+                self._depths.pop(cid, None)
+                self._depth_shape.pop(cid, None)
+        LOG.info(
+            "bundle invalidate cam=%s barrier_seq=%d",
+            "all" if cam_id is None else int(cam_id),
+            barrier,
+        )
+        return barrier
+
     def bounce_worker(self) -> None:
         """杀掉当前 worker，让 ``_loop`` 自动拉起（帧卡住时用）。"""
         proc = self._proc
@@ -176,10 +224,22 @@ class BundleFrameCache:
         )
 
     def wait_color_depth(
-        self, cam_id: int, *, timeout_s: float = 5.0, need_depth: bool = True
+        self,
+        cam_id: int,
+        *,
+        timeout_s: float = 5.0,
+        need_depth: bool = True,
+        min_seq: int | None = None,
+        allow_stale: bool = False,
     ) -> tuple[bytes, bytes | None]:
+        """取彩色(+深度)。``min_seq`` 给定时必须等到更新的 bundle seq（动臂后防旧帧）。
+
+        ``allow_stale=False``（默认）：超时仍无新 seq 则抛错，绝不退回旧 JPEG
+        （batch_009：精拍曾吃到粗定位同图 corr≈0.97）。
+        """
         cid = int(cam_id)
         deadline = time.monotonic() + float(timeout_s)
+        stale: tuple[bytes, bytes | None] | None = None
         while time.monotonic() < deadline:
             if self._stop.is_set():
                 break
@@ -188,14 +248,26 @@ class BundleFrameCache:
                 color = self._jpegs.get(cid)
                 depth = self._depths.get(cid)
                 ok = self._connected
+                seq = int(self._seq)
             if err and not ok:
                 raise RuntimeError(f"frame_bundle: {err}")
             if color and (depth or not need_depth):
-                return color, depth
+                stale = (color, depth)
+                if min_seq is None or seq > int(min_seq):
+                    return color, depth
             time.sleep(0.05)
+        if (
+            allow_stale
+            and stale is not None
+            and min_seq is not None
+        ):
+            # 显式允许时才退回旧帧
+            return stale
         raise TimeoutError(
             f"frame_bundle timeout waiting cam {cid} color"
-            f"{'+depth' if need_depth else ''} from {self.target}"
+            f"{'+depth' if need_depth else ''}"
+            f"{f' seq>{min_seq}' if min_seq is not None else ''} "
+            f"from {self.target}"
         )
 
     def _set_link(self, connected: bool, error: str = "") -> None:
@@ -237,7 +309,8 @@ class BundleFrameCache:
             "--depth",
             depth,
             "--hz",
-            str(max(1.0, min(float(self.max_hz), 15.0))),
+            # 与 capture_camera_subscribe 同量级；上限放宽到 30
+            str(max(1.0, min(float(self.max_hz), 30.0))),
             "--connect-timeout",
             str(max(3.0, float(self.timeout_s))),
         ]
@@ -276,8 +349,11 @@ class BundleFrameCache:
     def _consume(self, proc: subprocess.Popen) -> None:
         assert proc.stdout is not None
         magic = self._read_exact(proc.stdout, 4)
-        if magic != b"FB01":
+        # FB02 = capture_camera_subscribe 同路（JPEG/Z16 直通）
+        # FB01 = 旧 worker（JPEG 重压 + PNG 深度）
+        if magic not in (b"FB01", b"FB02"):
             raise RuntimeError(f"bad bundle magic {magic!r}")
+        proto2 = magic == b"FB02"
         self._set_link(True)
         # depth_id → color_id
         depth_to_color = {int(v): int(k) for k, v in self.depth_of_color.items()}
@@ -286,17 +362,27 @@ class BundleFrameCache:
             seq, n_parts = struct.unpack("<II", hdr)
             colors: dict[int, bytes] = {}
             depths: dict[int, bytes] = {}
+            depth_shapes: dict[int, tuple[int, int]] = {}
             for _ in range(int(n_parts)):
-                meta = self._read_exact(proc.stdout, 9)
-                cam_id, kind, nbytes = struct.unpack("<IBI", meta)
+                if proto2:
+                    meta = self._read_exact(proc.stdout, 13)
+                    cam_id, kind, width, height, nbytes = struct.unpack(
+                        "<IBHHI", meta
+                    )
+                else:
+                    meta = self._read_exact(proc.stdout, 9)
+                    cam_id, kind, nbytes = struct.unpack("<IBI", meta)
+                    width = height = 0
                 payload = self._read_exact(proc.stdout, int(nbytes))
                 if kind == 0:
                     if self.wanted is None or int(cam_id) in self.wanted:
                         colors[int(cam_id)] = payload
-                elif kind == 1:
+                elif kind in (1, 2):
                     color_id = depth_to_color.get(int(cam_id), int(cam_id))
                     if self.wanted is None or color_id in self.wanted:
                         depths[color_id] = payload
+                        if kind == 2 and width > 0 and height > 0:
+                            depth_shapes[color_id] = (int(height), int(width))
             if not colors and not depths:
                 continue
             with self._lock:
@@ -304,6 +390,12 @@ class BundleFrameCache:
                     self._jpegs.update(colors)
                 if depths:
                     self._depths.update(depths)
+                    for cid, sh in depth_shapes.items():
+                        self._depth_shape[cid] = sh
+                    # PNG 深度清掉 shape，避免误用旧尺寸
+                    for cid in depths:
+                        if cid not in depth_shapes:
+                            self._depth_shape.pop(cid, None)
                 self._seq = int(seq)
                 self._error = ""
                 self._connected = True
